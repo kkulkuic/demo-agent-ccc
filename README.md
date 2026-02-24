@@ -1,35 +1,3 @@
-# demo-agent-ccc
-Agent with browser use
-[react_web_assistant_react_headed_v4.py](https://github.com/user-attachments/files/25529418/react_web_assistant_react_headed_v4.py)
-"""
-ReAct Agent + Headed Playwright Tool (Claude) — v3 (Windows fix for NotImplementedError)
-
-Your traceback shows the real cause now:
-
-  asyncio.base_events._make_subprocess_transport -> NotImplementedError
-
-That happens when Playwright tries to launch its driver subprocess from a thread
-running an event loop that DOES NOT support subprocesses on Windows
-(e.g., SelectorEventLoop).
-
-LangGraph’s ToolNode runs tools in a worker thread. On Windows/Python 3.12 that
-thread may default to a loop policy that can’t spawn subprocesses -> boom.
-
-Fixes in this version:
-1) Force Windows Proactor event loop policy at import time.
-2) In the tool, ensure the *current thread* has a Proactor-compatible loop set.
-3) Keep your model fallback + JSON tool output.
-
-Install / upgrade (recommended):
-  pip install -U langgraph langchain langchain-core langchain-anthropic anthropic streamlit playwright
-  playwright install
-
-Run (Windows CMD):
-  set ANTHROPIC_API_KEY=YOUR_KEY
-  set CLAUDE_MODEL=claude-3-5-sonnet-20240620
-  streamlit run react_chat_headed_app_claude_fallback_v3.py
-"""
-
 import os
 import sys
 import json
@@ -46,11 +14,6 @@ from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMe
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# -----------------------------
-# Persistent headed browser sessions (multi-step workflows)
-# -----------------------------
-# NOTE: We keep browser/page objects in a module-level dict keyed by session_id.
-# This works better than relying on Streamlit session_state inside worker threads.
 BROWSER_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 def _get_session(session_id: str) -> Dict[str, Any]:
@@ -111,7 +74,6 @@ def safe_page_snapshot(page, max_chars: int = 6000) -> Dict[str, Any]:
     except Exception:
         body = ""
     return {"url": url, "title": title, "body_sample": body}
-
 
 
 # -----------------------------
