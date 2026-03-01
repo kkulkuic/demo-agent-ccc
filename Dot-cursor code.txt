@@ -1,0 +1,223 @@
+import sys
+import re
+import argparse
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+"""
+dot_only_demo.py
+
+Goal: open a site in headed mode and visualize the Playwright "virtual mouse" by drawing a dot
+that follows real DOM mousemove events.
+
+General-use addition:
+- You can optionally hover/click a specific element by providing:
+  --selector "CSS or xpath"
+  --click-text "English"
+  --role link|button|tab|menuitem (optional, default tries common roles)
+Examples:
+  python dot_only_demo.py https://www.wikipedia.org --click-text English
+  python dot_only_demo.py https://www.wikipedia.org --selector "a#js-link-box-en"
+  python dot_only_demo.py https://example.com --click-text "More information" --role link
+"""
+
+# Dot overlay that follows DOM mousemove events (fast: no per-step evaluate calls)
+DOT_JS = r"""
+(() => {
+  try {
+    // Remove old dot if present
+    const old = document.getElementById('__pw_dot');
+    if (old) old.remove();
+
+    // Create a very visible dot
+    const dot = document.createElement('div');
+    dot.id = '__pw_dot';
+    dot.style.cssText = `
+      position: fixed;
+      left: 200px; top: 200px;
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      background: red;
+      z-index: 2147483647;
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 0 4px rgba(255,0,0,0.35), 0 0 14px rgba(255,0,0,0.85);
+    `;
+    document.documentElement.appendChild(dot);
+
+    // Install the follower exactly once per document
+    if (!window.__pw_dot_follow_installed) {
+      window.__pw_dot_follow_installed = true;
+
+      window.addEventListener('mousemove', (e) => {
+        const d = document.getElementById('__pw_dot');
+        if (!d) return;
+        d.style.left = e.clientX + 'px';
+        d.style.top  = e.clientY + 'px';
+      }, true);
+
+      // Simple click ripple (helps you see clicks)
+      window.addEventListener('mousedown', (e) => {
+        const ring = document.createElement('div');
+        ring.style.cssText = `
+          position: fixed;
+          left:${e.clientX}px; top:${e.clientY}px;
+          width: 16px; height: 16px;
+          border: 3px solid red;
+          border-radius: 50%;
+          z-index: 2147483647;
+          pointer-events: none;
+          transform: translate(-50%, -50%);
+          opacity: 0.9;
+        `;
+        document.documentElement.appendChild(ring);
+        setTimeout(() => { try { ring.remove(); } catch(e) {} }, 550);
+      }, true);
+    }
+
+    true;
+  } catch (e) {
+    console.log('DOT install error', e);
+    false;
+  }
+})();
+"""
+
+def install_dot(page) -> None:
+    """Install the dot on the current document and park the mouse somewhere visible."""
+    ok = page.evaluate(DOT_JS)
+    exists = page.evaluate("() => !!document.getElementById('__pw_dot')")
+    print(f"[dot] install_ok={ok} exists={exists} url={page.url}")
+    # Park mouse (dot follows mousemove)
+    page.mouse.move(200, 200, steps=1)
+
+def slow_drag(page, x0, y0, x1, y1, steps=120, delay_ms=5) -> None:
+    """Smoothly move the mouse from A->B in many tiny steps (dot follows automatically)."""
+    dx = (x1 - x0) / steps
+    dy = (y1 - y0) / steps
+    for i in range(steps + 1):
+        x = x0 + dx * i
+        y = y0 + dy * i
+        page.mouse.move(x, y, steps=1)
+        if delay_ms:
+            page.wait_for_timeout(delay_ms)
+
+def hover_and_click_locator(page, locator, *, hover_steps=25, hover_pause_ms=250, click=True) -> bool:
+    """Hover over an element center (so dot follows), then optionally click."""
+    try:
+        locator.wait_for(state="visible", timeout=8000)
+        locator.scroll_into_view_if_needed(timeout=3000)
+        box = locator.bounding_box()
+        if not box:
+            return False
+        cx = box["x"] + box["width"] / 2.0
+        cy = box["y"] + box["height"] / 2.0
+
+        page.mouse.move(cx, cy, steps=hover_steps)
+        if hover_pause_ms:
+            page.wait_for_timeout(hover_pause_ms)
+        if click:
+            page.mouse.click(cx, cy)
+        return True
+    except Exception:
+        return False
+
+def find_click_target(page, *, selector=None, click_text=None, role=None):
+    """Return a locator for the target using selector/role/text heuristics."""
+    if selector:
+        return page.locator(selector).first
+
+    if not click_text:
+        return None
+
+    # If role is provided, try only that role first, else try common clickable roles
+    roles_to_try = [role] if role else ["button", "link", "menuitem", "tab"]
+
+    for r in roles_to_try:
+        try:
+            loc = page.get_by_role(r, name=click_text).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+        try:
+            loc = page.get_by_role(r, name=re.compile(re.escape(click_text), re.I)).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+
+    # Fallback: visible text anywhere
+    try:
+        loc = page.get_by_text(click_text, exact=True).first
+        if loc.count() > 0:
+            return loc
+    except Exception:
+        pass
+    try:
+        loc = page.get_by_text(click_text, exact=False).first
+        if loc.count() > 0:
+            return loc
+    except Exception:
+        pass
+
+    return None
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("url", nargs="?", default="https://www.wikipedia.org", help="URL to open")
+    p.add_argument("--selector", default=None, help="CSS/XPath selector to hover/click")
+    p.add_argument("--click-text", default=None, help="Visible text to hover/click (e.g., English, Español, Italiano)")
+    p.add_argument("--role", default=None, help="Optional ARIA role (link, button, tab, menuitem) to prioritize")
+    p.add_argument("--no-click", action="store_true", help="Only hover (do not click)")
+    p.add_argument("--demo-drag", action="store_true", help="Run the drag demo after load")
+    p.add_argument("--steps", type=int, default=120, help="Steps for demo drag (if --demo-drag)")
+    p.add_argument("--delay-ms", type=int, default=5, help="Delay per step (ms) for demo drag (if --demo-drag)")
+    p.add_argument("--keep-open-ms", type=int, default=15000, help="How long to keep the browser open at end")
+    return p.parse_args(argv)
+
+def main():
+    args = parse_args(sys.argv[1:])
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, slow_mo=0)
+        context = browser.new_context(viewport={"width": 1200, "height": 800})
+        page = context.new_page()
+
+        # Prove dot on blank page (quick sanity check)
+        page.goto("about:blank")
+        install_dot(page)
+        page.wait_for_timeout(500)
+
+        # Navigate to site
+        page.goto(args.url, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PlaywrightTimeoutError:
+            pass
+
+        install_dot(page)
+        page.wait_for_timeout(400)
+
+        # Optional: hover/click a target (general-use)
+        if args.selector or args.click_text:
+            target = find_click_target(page, selector=args.selector, click_text=args.click_text, role=args.role)
+            if target is None:
+                print("[target] Not found:", args.selector or args.click_text)
+            else:
+                ok = hover_and_click_locator(page, target, click=(not args.no_click))
+                print(f"[target] ok={ok} target={args.selector or args.click_text!r} clicked={not args.no_click}")
+
+        # Optional: drag demo
+        if args.demo_drag:
+            x0, y0 = 200, 200
+            path = [(900, 220), (900, 650), (250, 650), (250, 250), (800, 500)]
+            for (x1, y1) in path:
+                slow_drag(page, x0, y0, x1, y1, steps=max(5, args.steps), delay_ms=max(0, args.delay_ms))
+                x0, y0 = x1, y1
+
+        print(f"[done] Leaving the browser open for {args.keep_open_ms} ms so you can watch.")
+        page.wait_for_timeout(max(0, args.keep_open_ms))
+        browser.close()
+
+if __name__ == "__main__":
+    main()
