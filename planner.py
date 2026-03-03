@@ -1,10 +1,10 @@
 import json
 import os
-import re
 import time
 from anthropic import Anthropic
 
 import config
+from core.json_parser import extract_json_from_markdown
 
 # #region agent log
 def _log(hid, loc, msg, data):
@@ -15,30 +15,6 @@ def _log(hid, loc, msg, data):
     except Exception:
         pass
 # #endregion
-
-
-def _extract_json_from_markdown(text):
-    """Extract first JSON object from markdown (e.g. ```json ... ```). Returns stripped text or None."""
-    if not text or not text.strip():
-        return None
-    text = text.strip()
-    # Match ```json ... ``` or ``` ... ```
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # Fallback: find first { ... } block
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
 
 
 _client = None
@@ -90,7 +66,7 @@ Page context:
     # #region agent log
     _log("H1", "planner.py:plan_actions:before_loads", "content before json.loads", {"content_len": len(content), "content_empty": not (content or "").strip(), "preview": (content or "")[:400]})
     # #endregion
-    to_parse = _extract_json_from_markdown(content)
+    to_parse = extract_json_from_markdown(content)
     if to_parse is None:
         to_parse = (content or "").strip()
     try:

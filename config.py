@@ -25,26 +25,41 @@ def get_api_key() -> str:
 def get_planner_model() -> str:
     return os.getenv("PLANNER_MODEL", "claude-haiku-4-5-20251001")
 
+
+def get_industrial_model() -> str:
+    """Model for industrial/ReAct agent (defaults to planner model)."""
+    return os.getenv("INDUSTRIAL_MODEL") or get_planner_model()
+
+def get_max_steps() -> int:
+    """Max steps for industrial/ReAct agent loop (from env or default)."""
+    try:
+        return int(os.getenv("MAX_STEPS", "20"))
+    except ValueError:
+        return 20
+
+
+def get_max_retries() -> int:
+    """Max retries per step on failure (from env or default)."""
+    try:
+        return int(os.getenv("MAX_RETRIES", "3"))
+    except ValueError:
+        return 3
+
+
+def get_default_headless() -> bool:
+    """Default headless mode for browser (from env or default)."""
+    v = os.getenv("DEFAULT_HEADLESS", "false").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def get_viz_mode() -> str:
+    """Visualization mode: 'dot_hilite' (default), 'bounding_box', or 'both'."""
+    v = (os.getenv("VIZ_MODE") or "dot_hilite").strip().lower()
+    if v in ("dot_hilite", "bounding_box", "both"):
+        return v
+    return "dot_hilite"
+
+
 def get_model_candidates() -> list:
-    env_model = (os.getenv("CLAUDE_MODEL") or "").strip()
-    candidates = []
-    if env_model:
-        candidates.append(env_model)
-    candidates += [
-        "claude-3-5-sonnet-20240620",
-        "claude-3-7-sonnet-20250219",
-        "claude-3-7-sonnet-latest",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-sonnet-latest",
-        "claude-3-5-haiku-20241022",
-        "claude-3-haiku-20240307",
-        "claude-3-opus-20240229",
-        "claude-3-sonnet-20240229",
-    ]
-    seen = set()
-    out = []
-    for c in candidates:
-        if c and c not in seen:
-            out.append(c)
-            seen.add(c)
-    return out
+    """Single default model (for compatibility where a list is expected)."""
+    return [get_planner_model()]

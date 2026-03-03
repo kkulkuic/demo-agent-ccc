@@ -1,17 +1,14 @@
 """Headed browser tools for ReAct agent; optional visualization via set_enable_viz."""
 import json
+import os
+import threading
+import time
 from typing import Dict, Any
 
 from langchain_core.tools import tool
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-from core.browser import (
-    get_page,
-    start_browser_session,
-    stop_browser_session,
-    safe_page_snapshot,
-    ensure_thread_event_loop,
-)
+from core.browser import run_in_browser_thread, safe_page_snapshot, ensure_thread_event_loop
 from core.consent import dismiss_cookie_consent, looks_like_bot_challenge
 from core.visualization import (
     highlight_locator,
@@ -21,6 +18,18 @@ from core.visualization import (
 
 # Global flag for visualization in chat mode; set via set_enable_viz() from app.
 _ENABLE_VIZ = False
+
+# #region agent log
+def _log(hid: str, loc: str, msg: str, data: dict) -> None:
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        lp = os.path.join(root, "debug-3c73a9.log")
+        payload = {"sessionId": "3c73a9", "hypothesisId": hid, "location": loc, "message": msg, "data": {**data, "thread_id": threading.get_ident()}, "timestamp": int(time.time() * 1000)}
+        with open(lp, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 
 def set_enable_viz(value: bool) -> None:
@@ -94,12 +103,14 @@ def scrape_webpage_headed(url: str) -> str:
 @tool
 def open_url_headed(session_id: str, url: str) -> str:
     """Open a URL in a persistent headed browser session and try to dismiss cookie banners."""
+    _log("H1", "headed_tools:open_url_headed:entry", "open_url_headed called", {"session_id_len": len(session_id or ""), "url": (url or "")[:80]})
     try:
-        page = get_page(session_id)
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(900)
-        dismiss_cookie_consent(page)
-        snap = safe_page_snapshot(page)
+        def _do(page):
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(900)
+            dismiss_cookie_consent(page)
+            return safe_page_snapshot(page)
+        snap = run_in_browser_thread(session_id, _do)
         if looks_like_bot_challenge(snap.get("title"), snap.get("body_sample")):
             return json.dumps({"ok": False, "error": "Bot/verification wall detected. Please complete it manually in the opened browser, then tell me when you're done.", **snap}, indent=2)
         return json.dumps({"ok": True, "note": "Page opened.", **snap}, indent=2)
@@ -113,9 +124,10 @@ def open_url_headed(session_id: str, url: str) -> str:
 def read_page_headed(session_id: str, max_chars: int = 6000) -> str:
     """Read the current page (title + visible body text sample) from the persistent headed session."""
     try:
-        page = get_page(session_id)
-        page.wait_for_timeout(300)
-        snap = safe_page_snapshot(page, max_chars=max_chars)
+        def _do(page):
+            page.wait_for_timeout(300)
+            return safe_page_snapshot(page, max_chars=max_chars)
+        snap = run_in_browser_thread(session_id, _do)
         if looks_like_bot_challenge(snap.get("title"), snap.get("body_sample")):
             return json.dumps({"ok": False, "error": "Bot/verification wall detected. Please complete it manually in the opened browser, then tell me when you're done.", **snap}, indent=2)
         return json.dumps({"ok": True, **snap}, indent=2)
@@ -127,32 +139,34 @@ def read_page_headed(session_id: str, max_chars: int = 6000) -> str:
 def find_text_on_page(session_id: str, query: str) -> str:
     """Find occurrences of a text snippet on the current page. Returns counts + a few surrounding excerpts."""
     try:
-        page = get_page(session_id)
-        text = ""
-        try:
-            text = page.inner_text("body") or ""
-        except Exception:
+        def _do(page):
             text = ""
-        low = text.lower()
-        q = (query or "").lower().strip()
-        if not q:
-            return json.dumps({"ok": False, "error": "query is empty"}, indent=2)
-        idxs = []
-        start = 0
-        while True:
-            i = low.find(q, start)
-            if i == -1:
-                break
-            idxs.append(i)
-            start = i + len(q)
-            if len(idxs) >= 25:
-                break
-        excerpts = []
-        for i in idxs[:5]:
-            a = max(0, i - 80)
-            b = min(len(text), i + len(q) + 120)
-            excerpts.append(text[a:b].replace("\n", " ").strip())
-        return json.dumps({"ok": True, "query": query, "count": len(idxs), "excerpts": excerpts, "url": getattr(page, "url", None), "title": (page.title() or "").strip() or None}, indent=2)
+            try:
+                text = page.inner_text("body") or ""
+            except Exception:
+                text = ""
+            low = text.lower()
+            q = (query or "").lower().strip()
+            if not q:
+                return {"ok": False, "error": "query is empty"}
+            idxs = []
+            start = 0
+            while True:
+                i = low.find(q, start)
+                if i == -1:
+                    break
+                idxs.append(i)
+                start = i + len(q)
+                if len(idxs) >= 25:
+                    break
+            excerpts = []
+            for i in idxs[:5]:
+                a = max(0, i - 80)
+                b = min(len(text), i + len(q) + 120)
+                excerpts.append(text[a:b].replace("\n", " ").strip())
+            return {"ok": True, "query": query, "count": len(idxs), "excerpts": excerpts, "url": getattr(page, "url", None), "title": (page.title() or "").strip() or None}
+        out = run_in_browser_thread(session_id, _do)
+        return json.dumps(out, indent=2)
     except Exception as e:
         return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, indent=2)
 
@@ -160,27 +174,16 @@ def find_text_on_page(session_id: str, query: str) -> str:
 @tool
 def click_on_page(session_id: str, selector_or_text: str) -> str:
     """Click an element by CSS selector or by visible text (best-effort). Use for non-destructive navigation."""
+    _log("H1", "headed_tools:click_on_page:entry", "click_on_page called", {"session_id_len": len(session_id or ""), "selector_or_text": (selector_or_text or "")[:100]})
     try:
-        page = get_page(session_id)
         target = selector_or_text.strip()
-        clicked = False
-        if _ENABLE_VIZ:
-            ensure_overlays_installed(page, show_label=True)
-        try:
-            loc = page.locator(target).first
-            if loc.is_visible(timeout=1200):
-                if _ENABLE_VIZ:
-                    highlight_element_for_agent(page, loc, target)
-                else:
-                    highlight_locator(loc)
-                page.wait_for_timeout(300)
-                loc.click(timeout=5000)
-                clicked = True
-        except Exception:
+
+        def _do(page):
             clicked = False
-        if not clicked:
+            if _ENABLE_VIZ:
+                ensure_overlays_installed(page, show_label=True)
             try:
-                loc = page.get_by_text(target, exact=False).first
+                loc = page.locator(target).first
                 if loc.is_visible(timeout=1200):
                     if _ENABLE_VIZ:
                         highlight_element_for_agent(page, loc, target)
@@ -191,41 +194,64 @@ def click_on_page(session_id: str, selector_or_text: str) -> str:
                     clicked = True
             except Exception:
                 clicked = False
-        page.wait_for_timeout(800)
-        dismiss_cookie_consent(page)
-        snap = safe_page_snapshot(page)
+            if not clicked:
+                try:
+                    loc = page.get_by_text(target, exact=False).first
+                    if loc.is_visible(timeout=1200):
+                        if _ENABLE_VIZ:
+                            highlight_element_for_agent(page, loc, target)
+                        else:
+                            highlight_locator(loc)
+                        page.wait_for_timeout(300)
+                        loc.click(timeout=5000)
+                        clicked = True
+                except Exception:
+                    clicked = False
+            page.wait_for_timeout(800)
+            dismiss_cookie_consent(page)
+            return clicked, safe_page_snapshot(page)
+
+        clicked, snap = run_in_browser_thread(session_id, _do)
         if looks_like_bot_challenge(snap.get("title"), snap.get("body_sample")):
             return json.dumps({"ok": False, "error": "Bot/verification wall detected. Please complete it manually in the opened browser, then tell me when you're done.", "clicked": clicked, **snap}, indent=2)
         return json.dumps({"ok": clicked, "clicked": clicked, "note": "Clicked (best-effort).", **snap}, indent=2)
     except Exception as e:
+        _log("H2", "headed_tools:click_on_page:exception", "click_on_page raised", {"error_type": type(e).__name__, "error_str": str(e)[:300]})
         return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, indent=2)
 
 
 @tool
 def type_text_on_page(session_id: str, selector: str, text: str) -> str:
     """Type into an input by CSS selector. Never use this to enter passwords or MFA codes."""
+    _log("H1", "headed_tools:type_text_on_page:entry", "type_text_on_page called", {"session_id_len": len(session_id or ""), "selector": (selector or "")[:100]})
     try:
-        page = get_page(session_id)
         sel = selector.strip()
-        loc = page.locator(sel).first
-        if not loc.is_visible(timeout=2000):
-            return json.dumps({"ok": False, "error": f"Input not visible for selector: {sel}"}, indent=2)
         lowered = sel.lower()
         if any(k in lowered for k in ["password", "passcode", "otp", "mfa", "2fa"]):
             return json.dumps({"ok": False, "error": "Refusing to type into a likely sensitive field (password/OTP/MFA). Please type it yourself.", "selector": sel}, indent=2)
-        if _ENABLE_VIZ:
-            ensure_overlays_installed(page, show_label=True)
-            highlight_element_for_agent(page, loc, sel)
-            page.wait_for_timeout(300)
-        else:
-            highlight_locator(loc)
-            page.wait_for_timeout(300)
-        loc.fill("")
-        loc.type(text, delay=25)
-        page.wait_for_timeout(500)
-        snap = safe_page_snapshot(page)
+
+        def _do(page):
+            loc = page.locator(sel).first
+            if not loc.is_visible(timeout=2000):
+                return None, f"Input not visible for selector: {sel}"
+            if _ENABLE_VIZ:
+                ensure_overlays_installed(page, show_label=True)
+                highlight_element_for_agent(page, loc, sel)
+                page.wait_for_timeout(300)
+            else:
+                highlight_locator(loc)
+                page.wait_for_timeout(300)
+            loc.fill("")
+            loc.type(text, delay=25)
+            page.wait_for_timeout(500)
+            return safe_page_snapshot(page), None
+
+        snap, err = run_in_browser_thread(session_id, _do)
+        if err is not None:
+            return json.dumps({"ok": False, "error": err}, indent=2)
         return json.dumps({"ok": True, "note": "Typed text.", "selector": sel, **snap}, indent=2)
     except Exception as e:
+        _log("H2", "headed_tools:type_text_on_page:exception", "type_text_on_page raised", {"error_type": type(e).__name__, "error_str": str(e)[:300]})
         return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, indent=2)
 
 
@@ -233,7 +259,7 @@ def type_text_on_page(session_id: str, selector: str, text: str) -> str:
 def close_browser_headed(session_id: str) -> str:
     """Close the persistent headed browser session."""
     try:
-        stop_browser_session(session_id)
+        run_in_browser_thread(session_id, None)
         return json.dumps({"ok": True, "note": "Browser session closed."}, indent=2)
     except Exception as e:
         return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, indent=2)

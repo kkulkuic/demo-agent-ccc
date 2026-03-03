@@ -297,3 +297,51 @@ def highlight_element_for_agent(page, locator_or_handle, label_text: Optional[st
         )
     except Exception:
         return False
+
+
+def draw_bounding_box(page, locator, color: str = "red", line_width: int = 2, auto_remove_seconds: int = 5) -> None:
+    """
+    Draw a temporary bounding box around the element matched by locator.
+    Uses sync Playwright. Box auto-removes after auto_remove_seconds.
+    """
+    import time as _time
+    try:
+        bounding_box = locator.bounding_box()
+        if not bounding_box:
+            print("Cannot get element bounding box position.")
+            return
+        box_id = f"bounding-box-{int(_time.time())}"
+        page.evaluate(
+            """
+            ({box_id, x, y, width, height, color, line_width, auto_remove_seconds}) => {
+                const box = document.createElement('div');
+                box.id = box_id;
+                box.style.position = 'absolute';
+                box.style.left = `${x}px`;
+                box.style.top = `${y}px`;
+                box.style.width = `${width}px`;
+                box.style.height = `${height}px`;
+                box.style.border = `${line_width}px solid ${color}`;
+                box.style.zIndex = '9999';
+                box.style.pointerEvents = 'none';
+                document.body.appendChild(box);
+                setTimeout(() => {
+                    const el = document.getElementById(box_id);
+                    if (el) el.remove();
+                }, auto_remove_seconds * 1000);
+            }
+            """,
+            {
+                "box_id": box_id,
+                "x": bounding_box["x"],
+                "y": bounding_box["y"],
+                "width": bounding_box["width"],
+                "height": bounding_box["height"],
+                "color": color,
+                "line_width": line_width,
+                "auto_remove_seconds": auto_remove_seconds,
+            },
+        )
+        print(f"Drew {color} bounding box (auto-removes in {auto_remove_seconds}s).")
+    except Exception as e:
+        print(f"Bounding box draw failed: {str(e)[:50]}")

@@ -8,9 +8,10 @@ from typing import List
 import streamlit as st
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 
-from core.browser import get_page, stop_browser_session
+import config
+from core.browser import run_in_browser_thread
 from agent.auto import run_auto_agent
-from agent.chat import build_chat_agent, get_model_candidates, is_model_not_found_error
+from agent.chat import build_chat_agent
 import tools.headed_tools as headed_tools
 
 st.set_page_config(page_title="Agent-Browser", page_icon="🧭", layout="wide")
@@ -22,12 +23,6 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "model_in_use" not in st.session_state:
-    st.session_state.model_in_use = None
-if "model_candidates" not in st.session_state:
-    st.session_state.model_candidates = get_model_candidates()
-if "model_index" not in st.session_state:
-    st.session_state.model_index = 0
 if "last_traceback" not in st.session_state:
     st.session_state.last_traceback = ""
 if "mode" not in st.session_state:
@@ -45,17 +40,13 @@ with st.sidebar:
     enable_viz = st.checkbox("Show dot + element highlight during actions", value=st.session_state.enable_viz, key="enable_viz_cb")
     st.session_state.enable_viz = enable_viz
 
-    st.subheader("Claude Model")
     try:
-        _api_key_set = bool(__import__("config").get_api_key())
+        _api_key_set = bool(config.get_api_key())
     except Exception:
         _api_key_set = False
     if not _api_key_set:
         st.error("API key missing. Set ANTHROPIC_API_KEY in system env, or create a .env file in the project root with: ANTHROPIC_API_KEY=sk-ant-...")
         st.caption("If you set system env, restart the terminal/IDE before running streamlit.")
-    st.write("Using:", st.session_state.get("model_in_use") or "(not set yet)")
-    st.caption("Auto mode uses planner model from config; Chat uses first available from list.")
-    st.code("\n".join(st.session_state.model_candidates[:5]))
 
     st.subheader("Debug")
     with st.expander("Last traceback"):
@@ -64,13 +55,13 @@ with st.sidebar:
     if sys.platform.startswith("win"):
         st.caption("Windows: Proactor event loop is set for Playwright in tool threads.")
 
-    st.subheader("Browser 窗口")
-    st.info("运行 Auto 或发送 Chat 消息时会打开**可见的浏览器窗口**。请在该窗口中查看 agent 的操作；如遇验证码或人机验证，请在该窗口中手动完成。")
+    st.subheader("Browser window")
+    st.info("Running Auto or sending a Chat message opens a visible browser window. Use it to observe agent actions; complete CAPTCHA or human verification manually if prompted.")
     st.caption("Same browser session for both modes.")
     st.code(st.session_state.session_id)
     if st.button("Close browser session"):
         try:
-            stop_browser_session(st.session_state.session_id)
+            run_in_browser_thread(st.session_state.session_id, None)
             st.success("Browser session closed.")
         except Exception as e:
             st.error(str(e))
@@ -91,23 +82,6 @@ def render_trace(messages: List[BaseMessage]) -> str:
                 if role == "assistant":
                     final = content
     return final
-
-
-def invoke_chat_with_fallback(lc_messages: List[BaseMessage]):
-    candidates = st.session_state.model_candidates
-    idx = st.session_state.model_index
-    for _ in range(len(candidates)):
-        model = candidates[idx]
-        try:
-            st.session_state.model_in_use = model
-            agent = build_chat_agent(model, session_id=st.session_state.session_id)
-            return agent.invoke({"messages": lc_messages})
-        except Exception as e:
-            if is_model_not_found_error(e) and (idx + 1) < len(candidates):
-                idx += 1
-                st.session_state.model_index = idx
-                continue
-            raise
 
 
 def to_lc_messages(history: List[dict]) -> List[BaseMessage]:
@@ -172,7 +146,8 @@ else:
         lc_messages = to_lc_messages(st.session_state.messages)
         with st.spinner("Thinking…"):
             try:
-                result = invoke_chat_with_fallback(lc_messages)
+                agent = build_chat_agent(config.get_planner_model(), session_id=st.session_state.session_id)
+                result = agent.invoke({"messages": lc_messages})
                 trace = result.get("messages", []) if isinstance(result, dict) else []
                 if trace:
                     final_text = render_trace(trace) or getattr(trace[-1], "content", str(trace[-1]))

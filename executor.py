@@ -15,7 +15,9 @@ class BrowserAgent:
         session_id: Optional[str] = None,
         get_page: Optional[Callable[[str], Any]] = None,
         enable_viz: bool = False,
+        viz_mode: Optional[str] = None,
     ):
+        import config
         self._owned_playwright = None
         self._owned_browser = None
         self._owned_context = None
@@ -23,6 +25,7 @@ class BrowserAgent:
         self._session_id = session_id
         self._get_page = get_page
         self._enable_viz = enable_viz
+        self._viz_mode = (viz_mode if viz_mode is not None else config.get_viz_mode())
         self._viz_installed = False
 
         if page is not None:
@@ -48,15 +51,48 @@ class BrowserAgent:
         except Exception:
             pass
 
+    def _draw_bbox_if_needed(self, loc) -> None:
+        if not self._enable_viz or self._viz_mode not in ("bounding_box", "both"):
+            return
+        try:
+            from core.visualization import draw_bounding_box
+            if loc.count() > 0:
+                draw_bounding_box(self.page, loc, color="red", line_width=2, auto_remove_seconds=5)
+                time.sleep(0.2)
+        except Exception:
+            pass
+
+    def _looks_like_selector(self, target: str) -> bool:
+        """True if target is likely a CSS selector (e.g. #id, .class, [attr])."""
+        t = (target or "").strip()
+        return bool(t and (t.startswith("#") or t.startswith(".") or t.startswith("[") or ("[" in t and "]" in t)))
+
     def _highlight_then_click(self, target: str) -> None:
         from core.visualization import ensure_overlays_installed, highlight_element_for_agent
-        self._ensure_viz()
+        if self._viz_mode in ("dot_hilite", "both"):
+            self._ensure_viz()
         loc = None
+        if self._looks_like_selector(target):
+            try:
+                loc = self.page.locator(target).first
+                if loc.count() > 0:
+                    if self._enable_viz:
+                        if self._viz_mode in ("dot_hilite", "both"):
+                            ensure_overlays_installed(self.page, show_label=True)
+                            highlight_element_for_agent(self.page, loc, target)
+                        self._draw_bbox_if_needed(loc)
+                        time.sleep(0.3)
+                    loc.click()
+                    return
+            except Exception as e:
+                raise
         try:
             loc = self.page.get_by_role("button", name=target).first
             if loc.count() > 0 and self._enable_viz:
-                ensure_overlays_installed(self.page, show_label=True)
-                highlight_element_for_agent(self.page, loc, target)
+                if self._viz_mode in ("dot_hilite", "both"):
+                    ensure_overlays_installed(self.page, show_label=True)
+                    highlight_element_for_agent(self.page, loc, target)
+                self._draw_bbox_if_needed(loc)
                 time.sleep(0.3)
             loc.click()
             return
@@ -65,8 +101,10 @@ class BrowserAgent:
         try:
             loc = self.page.get_by_text(target).first
             if loc.count() > 0 and self._enable_viz:
-                ensure_overlays_installed(self.page, show_label=True)
-                highlight_element_for_agent(self.page, loc, target)
+                if self._viz_mode in ("dot_hilite", "both"):
+                    ensure_overlays_installed(self.page, show_label=True)
+                    highlight_element_for_agent(self.page, loc, target)
+                self._draw_bbox_if_needed(loc)
                 time.sleep(0.3)
             loc.click()
             return
@@ -75,8 +113,10 @@ class BrowserAgent:
         try:
             loc = self.page.locator(f"text={target}").first
             if loc.count() > 0 and self._enable_viz:
-                ensure_overlays_installed(self.page, show_label=True)
-                highlight_element_for_agent(self.page, loc, target)
+                if self._viz_mode in ("dot_hilite", "both"):
+                    ensure_overlays_installed(self.page, show_label=True)
+                    highlight_element_for_agent(self.page, loc, target)
+                self._draw_bbox_if_needed(loc)
                 time.sleep(0.3)
             loc.click()
         except Exception:
@@ -89,14 +129,20 @@ class BrowserAgent:
     def robust_click(self, target: str) -> None:
         if self._enable_viz:
             self._highlight_then_click(target)
-        else:
+            return
+        if self._looks_like_selector(target):
             try:
-                self.page.get_by_role("button", name=target).click()
+                self.page.locator(target).first.click()
+                return
             except Exception:
-                try:
-                    self.page.get_by_text(target).click()
-                except Exception:
-                    self.page.locator(f"text={target}").first.click()
+                raise
+        try:
+            self.page.get_by_role("button", name=target).click()
+        except Exception:
+            try:
+                self.page.get_by_text(target).click()
+            except Exception:
+                self.page.locator(f"text={target}").first.click()
 
     def execute(self, action: dict) -> None:
         action_type = action.get("action")
@@ -108,18 +154,34 @@ class BrowserAgent:
         if action_type == "click":
             self.robust_click(target)
         elif action_type == "type":
-            if self._enable_viz:
-                self._ensure_viz()
-                try:
-                    loc = self.page.get_by_label(target).first
-                    if loc.count() > 0:
-                        from core.visualization import ensure_overlays_installed, highlight_element_for_agent
-                        ensure_overlays_installed(self.page, show_label=True)
-                        highlight_element_for_agent(self.page, loc, target)
-                        time.sleep(0.3)
-                except Exception:
-                    pass
-            self.page.get_by_label(target).fill(text)
+            if self._looks_like_selector(target):
+                loc = self.page.locator(target).first
+                if self._enable_viz and loc.count() > 0:
+                    if self._viz_mode in ("dot_hilite", "both"):
+                        self._ensure_viz()
+                        try:
+                            from core.visualization import ensure_overlays_installed, highlight_element_for_agent
+                            ensure_overlays_installed(self.page, show_label=True)
+                            highlight_element_for_agent(self.page, loc, target)
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+                    self._draw_bbox_if_needed(loc)
+                loc.fill(text)
+            else:
+                loc = self.page.get_by_label(target).first
+                if self._enable_viz and loc.count() > 0:
+                    if self._viz_mode in ("dot_hilite", "both"):
+                        self._ensure_viz()
+                        try:
+                            from core.visualization import ensure_overlays_installed, highlight_element_for_agent
+                            ensure_overlays_installed(self.page, show_label=True)
+                            highlight_element_for_agent(self.page, loc, target)
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+                    self._draw_bbox_if_needed(loc)
+                self.page.get_by_label(target).fill(text)
         elif action_type == "navigate":
             self.page.goto(target)
             self._viz_installed = False

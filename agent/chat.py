@@ -1,6 +1,4 @@
-"""Chat mode: ReAct agent with headed browser tools; model fallback via config."""
-from typing import List
-
+"""Chat mode: ReAct agent with headed browser tools; uses default model from config."""
 from langgraph.prebuilt import create_react_agent
 from langchain_anthropic import ChatAnthropic
 
@@ -14,11 +12,6 @@ from tools.headed_tools import (
     close_browser_headed,
     scrape_webpage_headed,
 )
-
-
-def is_model_not_found_error(e: Exception) -> bool:
-    txt = str(e).lower()
-    return ("not_found" in txt and "model" in txt) or ("not_found_error" in txt)
 
 
 def build_chat_agent(model_name: str, session_id: str):
@@ -62,7 +55,3 @@ Tool use guidance:
         scrape_webpage_headed,
     ]
     return create_react_agent(model=llm, tools=tools, prompt=system_prompt)
-
-
-def get_model_candidates() -> List[str]:
-    return config.get_model_candidates()
