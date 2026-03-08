@@ -1,4 +1,4 @@
-# Agent-Browser
+# Agent-Browser - Kaige's Version
 
 Browser automation driven by natural language: one Streamlit app with **Auto** (plan + execute) and **Chat** (ReAct + headed browser) modes, shared session, and optional behavior visualization (dot cursor, element highlight, bounding box). Both modes use a single default model (override via `PLANNER_MODEL`).
 
