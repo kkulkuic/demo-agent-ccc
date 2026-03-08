@@ -1,0 +1,274 @@
+#python border_highlight_demo.py https://www.wikipedia.org --show-label (highlights everything)
+
+#python border_highlight_demo.py https://www.wikipedia.org --lock-on-click --show-label (locks into a section)
+
+#python border_highlight_demo.py https://www.wikipedia.org --click-text English --lock-on-click (dot goes to english and clicks it)
+
+#python border_highlight_demo.py https://www.wikipedia.org --selector "a.link-box" --no-click (shows the cursor move and how the highlighted borders on different items)
+
+import argparse
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+# ----------------------------
+# JS to highlight date text
+# ----------------------------
+HILITE_JS = r"""
+() => {
+  const root = document.querySelector('#search') || document.body;
+
+  const walker = document.createTreeWalker(
+    root,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+        // Normalize NBSP -> normal spaces
+        const t = node.nodeValue.replace(/\u00A0/g, ' ').trim();
+        if (!t) return NodeFilter.FILTER_REJECT;
+        const p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        const tag = p.tagName?.toLowerCase();
+        if (tag === 'script' || tag === 'style' || tag === 'noscript') {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    }
+  );
+
+  // STRICT "under 1 year" relative timestamps:
+  // - matches: "10 months ago", "3 days ago", "2 hours ago", "15 mins ago", etc.
+  // - also matches when preceded by separators like "· 10 months ago"
+  // - deliberately EXCLUDES any "year(s) ago" variants
+  const rel_under_year = /(?:^|[\s·•|,;:\-])\d+\s*(min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|wks|week|weeks|mo|mos|month|months)\s+ago\b/i;
+
+  // Optional absolute date patterns (kept from earlier versions).
+  // Note: These do NOT guarantee "under 1 year" without parsing; we highlight them anyway ONLY if they appear.
+  // If you want absolute dates filtered too, tell me and we’ll add a small parser.
+  const abs = /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December)\s+\d{1,2},\s*\d{4}\b/i;
+  const iso = /\b\d{4}-\d{2}-\d{2}\b/;
+
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+
+  let highlighted = 0;
+
+  for (const node of nodes) {
+    const text = node.nodeValue.replace(/\u00A0/g, ' ');
+
+    if (!(rel_under_year.test(text) || abs.test(text) || iso.test(text))) continue;
+
+    const frag = document.createDocumentFragment();
+    let i = 0;
+
+    while (i < text.length) {
+      const rest = text.slice(i);
+
+      const mRel = rel_under_year.exec(rest);
+      const mAbs = abs.exec(rest);
+      const mIso = iso.exec(rest);
+
+      const matches = [];
+      if (mRel) matches.push({ idx: mRel.index, val: mRel[0], kind: "rel" });
+      if (mAbs) matches.push({ idx: mAbs.index, val: mAbs[0], kind: "abs" });
+      if (mIso) matches.push({ idx: mIso.index, val: mIso[0], kind: "iso" });
+
+      if (matches.length === 0) {
+        frag.appendChild(document.createTextNode(rest));
+        break;
+      }
+
+      matches.sort((a, b) => a.idx - b.idx);
+      const best = matches[0];
+
+      if (best.idx > 0) {
+        frag.appendChild(document.createTextNode(rest.slice(0, best.idx)));
+      }
+
+      // Clean leading separator characters so we outline just the timestamp text
+      const cleaned = best.val.replace(/^[\s·•|,;:\-]+/, '');
+
+      const span = document.createElement('span');
+      span.textContent = cleaned;
+      span.title = (best.kind === "rel")
+        ? "Detected relative time (< 1 year)"
+        : "Detected date text";
+      Object.assign(span.style, {
+        outline: '3px solid #00C853',
+        borderRadius: '999px',
+        padding: '0 6px',
+        margin: '0 2px',
+        background: 'rgba(0,200,83,0.10)',
+        display: 'inline-block'
+      });
+
+      frag.appendChild(span);
+      highlighted++;
+
+      i += best.idx + best.val.length;
+
+      // reset regex lastIndex because we exec on substrings repeatedly
+      rel_under_year.lastIndex = 0;
+      abs.lastIndex = 0;
+      iso.lastIndex = 0;
+    }
+
+    node.parentNode.replaceChild(frag, node);
+  }
+
+  return { highlighted };
+}
+"""
+
+def dismiss_google_prompts(page, debug=False):
+    """
+    Best-effort dismissal of Google promo dialogs (including ones inside iframes).
+    Safe to call multiple times.
+    """
+    # ESC often closes dialogs
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    text_selectors = [
+        "button:has-text('No thanks')",
+        "button:has-text('Not now')",
+        "button:has-text('Skip')",
+        "button:has-text('Got it')",
+        "button:has-text('Dismiss')",
+        "button:has-text('Close')",
+        "div[role='button']:has-text('No thanks')",
+        "div[role='button']:has-text('Not now')",
+        "div[role='button']:has-text('Got it')",
+        "div[role='button']:has-text('Close')",
+        "button[aria-label='Close']",
+        "div[role='button'][aria-label='Close']",
+        "[aria-label='Close']",
+    ]
+
+    css_selectors = [
+        "div[role='dialog'] button[aria-label='Close']",
+        "div[role='dialog'] [aria-label='Close']",
+        "div[aria-modal='true'] [aria-label='Close']",
+    ]
+
+    def try_click(ctx, sel):
+        try:
+            loc = ctx.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                if debug:
+                    print(f"[dismiss] clicking: {sel}", flush=True)
+                loc.click(timeout=1500)
+                return True
+        except Exception:
+            return False
+        return False
+
+    # Try main page
+    for sel in text_selectors + css_selectors:
+        if try_click(page, sel):
+            page.wait_for_timeout(350)
+            return True
+
+    # Try frames (iframes)
+    for frame in page.frames:
+        for sel in text_selectors + css_selectors:
+            if try_click(frame, sel):
+                page.wait_for_timeout(350)
+                return True
+
+    return False
+
+
+def wait_for_results_or_user(page):
+    """
+    Minimal human-in-the-loop:
+    - If Google blocks or results don't appear, let user solve it and press Enter.
+    """
+    if "sorry" in page.url:
+        print("Google bot verification detected (/sorry). Solve it in the browser.")
+        input("After you solve it, press Enter here to continue...")
+        return
+
+    try:
+        page.locator("#search").wait_for(state="visible", timeout=12000)
+    except Exception:
+        print("Search results (#search) not visible yet.")
+        print("If you see a Google prompt or verification overlay, dismiss/complete it in the browser.")
+        input("When the results page is visible, press Enter here to continue...")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("query", nargs="+", help="Search query (no quotes needed).")
+    ap.add_argument("--headed", action="store_true", help="Show the browser window.")
+    ap.add_argument("--user-data-dir", default=".pw_google_profile_min", help="Persistent profile folder.")
+    ap.add_argument("--type-delay", type=int, default=40, help="Typing delay (ms).")
+    ap.add_argument("--debug-dismiss", action="store_true", help="Print what dismissal buttons it tries.")
+    args = ap.parse_args()
+
+    query = " ".join(args.query).strip()
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=args.user_data_dir,
+            headless=not args.headed,
+            viewport=None,
+        )
+        page = context.new_page()
+
+        print(f"Opening Google and searching: {query}", flush=True)
+        page.goto("https://www.google.com", wait_until="domcontentloaded")
+
+        # If captcha immediately:
+        if "sorry" in page.url:
+            print("Captcha detected on open. Solve it in the browser.")
+            input("Then press Enter here to continue...")
+
+        # Attempt to dismiss random prompts on landing
+        dismiss_google_prompts(page, debug=args.debug_dismiss)
+
+        # Search
+        try:
+            box = page.locator("textarea[name='q'], input[name='q']").first
+            box.wait_for(state="visible", timeout=15000)
+            box.click()
+            box.fill("")
+            box.type(query, delay=args.type_delay)
+            page.keyboard.press("Enter")
+        except PWTimeoutError:
+            print("Could not find the search box (possible consent screen).", flush=True)
+            print("Fix the prompt in the browser, then press Enter to continue.")
+            input()
+
+        # Let navigation happen
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
+        except Exception:
+            pass
+
+        # Dismiss prompts that appear after search (including iframe ones)
+        dismiss_google_prompts(page, debug=args.debug_dismiss)
+        dismiss_google_prompts(page, debug=args.debug_dismiss)  # twice helps with chained popups
+
+        # If blocked or results not visible, pause for you
+        wait_for_results_or_user(page)
+
+        # One more prompt-dismiss pass before highlighting
+        dismiss_google_prompts(page, debug=args.debug_dismiss)
+
+        # Highlight "under 1 year" relative timestamps (and any visible absolute date strings)
+        try:
+            result = page.evaluate(HILITE_JS)
+            print(f"Highlighted date strings (strict < 1 year): {result.get('highlighted', 0)}", flush=True)
+        except Exception as e:
+            print(f"Highlight failed: {e}", flush=True)
+
+        print("Browser will stay open. Press Enter here to close it.", flush=True)
+        input()
+        context.close()
+
+
+if __name__ == "__main__":
+    main()
