@@ -1,0 +1,336 @@
+from playwright.sync_api import TimeoutError as PWTimeoutError
+
+from core.browser_session import BrowserSession
+
+
+def dismiss_cookie_consent(page) -> None:
+    candidates = [
+        "button:has-text('Accept')",
+        "button:has-text('I agree')",
+        "button:has-text('Allow all')",
+        "button:has-text('Accept all')",
+        "button:has-text('Got it')",
+        "button:has-text('OK')",
+        "text=Accept",
+        "text=I agree",
+        "text=Allow all",
+        "text=Accept all",
+    ]
+
+    for selector in candidates:
+        try:
+            locator = page.locator(selector).first
+            if locator.is_visible(timeout=800):
+                locator.click(timeout=1500)
+                page.wait_for_timeout(500)
+                return
+        except Exception:
+            continue
+
+
+def safe_page_snapshot(page, max_chars: int = 3000) -> dict:
+    title = ""
+    body_sample = ""
+    url = ""
+
+    try:
+        title = (page.title() or "").strip()
+    except Exception:
+        title = ""
+
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+
+    try:
+        body_sample = (page.locator("body").inner_text(timeout=5000) or "")[:max_chars]
+    except Exception:
+        body_sample = ""
+
+    return {
+        "url": url,
+        "title": title,
+        "body_sample": body_sample
+    }
+
+
+def looks_like_bot_challenge(session: BrowserSession) -> dict:
+    page = session.get_page()
+
+    try:
+        body_text = (page.locator("body").inner_text(timeout=4000) or "").lower()
+    except Exception:
+        body_text = ""
+
+    try:
+        title = (page.title() or "").lower()
+    except Exception:
+        title = ""
+
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+
+    triggers = [
+        "unusual traffic",
+        "about this page",
+        "sorry/index",
+        "not a robot",
+        "captcha",
+        "verify you are human",
+        "our systems have detected unusual traffic",
+    ]
+
+    haystack = f"{title}\n{url}\n{body_text}"
+    matched = [t for t in triggers if t in haystack]
+
+    return {
+        "ok": True,
+        "is_bot_challenge": len(matched) > 0,
+        "matched_triggers": matched,
+        "url": url,
+        "title": title,
+        "body_sample": body_text[:1500]
+    }
+
+
+def install_red_dot(page) -> None:
+    page.evaluate(
+        """
+        () => {
+            if (document.getElementById('__agent_red_dot__')) return;
+
+            const dot = document.createElement('div');
+            dot.id = '__agent_red_dot__';
+            dot.style.position = 'fixed';
+            dot.style.width = '14px';
+            dot.style.height = '14px';
+            dot.style.borderRadius = '50%';
+            dot.style.background = 'red';
+            dot.style.zIndex = '2147483647';
+            dot.style.pointerEvents = 'none';
+            dot.style.left = '0px';
+            dot.style.top = '0px';
+            dot.style.boxShadow = '0 0 10px rgba(255,0,0,0.8)';
+            document.body.appendChild(dot);
+        }
+        """
+    )
+
+
+def move_red_dot(page, x: float, y: float) -> None:
+    page.evaluate(
+        """
+        ([x, y]) => {
+            const dot = document.getElementById('__agent_red_dot__');
+            if (!dot) return;
+            dot.style.left = `${x - 7}px`;
+            dot.style.top = `${y - 7}px`;
+        }
+        """,
+        [x, y]
+    )
+
+
+def highlight_selector(page, selector: str) -> None:
+    try:
+        page.locator(selector).first.evaluate(
+            """
+            el => {
+                el.style.outline = '3px solid red';
+                el.style.outlineOffset = '2px';
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+def open_url_headed(session: BrowserSession, url: str, timeout_ms: int = 30000) -> dict:
+    page = session.get_page()
+
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(1000)
+        dismiss_cookie_consent(page)
+        return {
+            "ok": True,
+            "note": "Page opened.",
+            **safe_page_snapshot(page)
+        }
+    except PWTimeoutError:
+        return {
+            "ok": False,
+            "error": f"Timeout loading {url}"
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }
+
+
+def read_page_headed(session: BrowserSession, max_chars: int = 3000) -> dict:
+    page = session.get_page()
+    try:
+        page.wait_for_timeout(300)
+        return {
+            "ok": True,
+            **safe_page_snapshot(page, max_chars=max_chars)
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }
+
+
+def type_text_on_page(
+    session: BrowserSession,
+    selector: str,
+    text: str,
+    delay_ms: int = 25,
+    press_enter: bool = False,
+    show_viz: bool = True
+) -> dict:
+    page = session.get_page()
+
+    try:
+        locator = page.locator(selector).first
+
+        if not locator.is_visible(timeout=3000):
+            return {
+                "ok": False,
+                "error": f"Input not visible for selector: {selector}"
+            }
+
+        if show_viz:
+            install_red_dot(page)
+            box = locator.bounding_box()
+            if box:
+                move_red_dot(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                highlight_selector(page, selector)
+                page.wait_for_timeout(500)
+
+        locator.fill("")
+        locator.type(text, delay=delay_ms)
+
+        if press_enter:
+            locator.press("Enter")
+
+        page.wait_for_timeout(1500)
+
+        return {
+            "ok": True,
+            "note": "Typed text.",
+            "selector": selector,
+            "text": text,
+            **safe_page_snapshot(page)
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }
+
+
+def click_on_page(
+    session: BrowserSession,
+    selector_or_text: str,
+    show_viz: bool = True
+) -> dict:
+    page = session.get_page()
+
+    try:
+        locator = None
+
+        try:
+            loc = page.locator(selector_or_text).first
+            if loc.is_visible(timeout=1200):
+                locator = loc
+        except Exception:
+            locator = None
+
+        if locator is None:
+            try:
+                loc = page.get_by_text(selector_or_text, exact=False).first
+                if loc.is_visible(timeout=1200):
+                    locator = loc
+            except Exception:
+                locator = None
+
+        if locator is None:
+            return {
+                "ok": False,
+                "error": f"Could not find clickable target: {selector_or_text}"
+            }
+
+        if show_viz:
+            install_red_dot(page)
+            box = locator.bounding_box()
+            if box:
+                move_red_dot(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                page.wait_for_timeout(500)
+
+        locator.click(timeout=5000)
+        page.wait_for_timeout(1200)
+        dismiss_cookie_consent(page)
+
+        return {
+            "ok": True,
+            "clicked": True,
+            "note": "Clicked target.",
+            **safe_page_snapshot(page)
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }
+
+
+def get_current_url(session: BrowserSession) -> dict:
+    page = session.get_page()
+    try:
+        return {
+            "ok": True,
+            "url": page.url
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }
+
+
+def capture_screenshot(session: BrowserSession, path: str = "headed_step.png") -> dict:
+    page = session.get_page()
+    try:
+        page.screenshot(path=path, full_page=True)
+        return {
+            "ok": True,
+            "path": path
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }
+
+
+def close_browser_headed(session: BrowserSession) -> dict:
+    try:
+        session.close()
+        return {
+            "ok": True,
+            "note": "Browser session closed."
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}"
+        }
