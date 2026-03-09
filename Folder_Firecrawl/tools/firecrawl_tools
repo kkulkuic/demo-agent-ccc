@@ -1,0 +1,23 @@
+from core.firecrawl_client import FirecrawlClient
+
+_fc = FirecrawlClient()
+
+
+def search_web(query: str, limit: int = 5):
+    return _fc.search(query=query, limit=limit)
+
+
+def scrape_url(url: str, formats: list[str] | None = None):
+    return _fc.scrape(url=url, formats=formats)
+
+
+def map_site(url: str, limit: int = 20):
+    return _fc.map_site(url=url, limit=limit)
+
+
+def crawl_site(url: str, limit: int = 10):
+    return _fc.crawl_site(url=url, limit=limit)
+
+
+def extract_structured(prompt: str, urls: list[str] | None = None):
+    return _fc.extract(prompt=prompt, urls=urls)
