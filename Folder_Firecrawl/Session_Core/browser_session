@@ -1,0 +1,53 @@
+from playwright.sync_api import sync_playwright
+
+
+class BrowserSession:
+    def __init__(self, headless: bool = False, slow_mo: int = 150):
+        self.headless = headless
+        self.slow_mo = slow_mo
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+
+    def start(self):
+        if self.page is not None:
+            return self.page
+
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
+            headless=self.headless,
+            slow_mo=self.slow_mo
+        )
+        self.context = self.browser.new_context()
+        self.page = self.context.new_page()
+        return self.page
+
+    def get_page(self):
+        if self.page is None:
+            return self.start()
+        return self.page
+
+    def close(self):
+        try:
+            if self.context is not None:
+                self.context.close()
+        except Exception:
+            pass
+
+        try:
+            if self.browser is not None:
+                self.browser.close()
+        except Exception:
+            pass
+
+        try:
+            if self.playwright is not None:
+                self.playwright.stop()
+        except Exception:
+            pass
+
+        self.context = None
+        self.browser = None
+        self.page = None
+        self.playwright = None
