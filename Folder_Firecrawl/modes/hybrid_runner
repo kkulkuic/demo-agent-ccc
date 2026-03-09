@@ -1,0 +1,643 @@
+import time
+import traceback
+from typing import Any
+
+from core.browser_session import BrowserSession
+from telemetry import TraceLogger
+from tools.headed_tools import (
+    open_url_headed,
+    type_text_on_page,
+    read_page_headed,
+    close_browser_headed,
+    looks_like_bot_challenge,
+    capture_screenshot,
+)
+from tools.firecrawl_tools import scrape_url, map_site, crawl_site, extract_structured
+from executor import (
+    summarize_text,
+    summarize_single_page,
+    summarize_multi_page_results,
+    get_markdown_from_result,
+    extract_first_url_from_search_result,
+    extract_urls_from_search_result,
+    normalize_search_query,
+)
+
+
+class HybridRunner:
+    """
+    Headed / hybrid executor.
+
+    This version:
+    - supports run_plan(plan)
+    - uses the same high-level tool names as the headless executor
+    - cleans user instruction before Google search
+    - can scrape either the first search result or multiple results
+    - visibly navigates through result pages in headed mode
+    - still uses Firecrawl for structured page scraping
+    - optionally uses an LLM for query optimization and result ranking
+    - logs full traceback details on error
+    """
+
+    def __init__(self, instruction: str, slow_mo: int = 150, llm_client=None):
+        self.instruction = instruction
+        self.trace_logger = TraceLogger(instruction=instruction, mode="hybrid")
+        self.context = {}
+        self.llm_client = llm_client
+
+        try:
+            self.session = BrowserSession(headless=False, slow_mo=slow_mo)
+            self.context["session_initialized"] = True
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to initialize BrowserSession: {type(e).__name__}: {repr(e)}"
+            ) from e
+
+    def _run_step(self, step_number, tool_name, args, func, *func_args, **func_kwargs):
+        start_perf = time.perf_counter()
+        start_time_iso = self.trace_logger.now_iso()
+
+        try:
+            result = func(*func_args, **func_kwargs)
+
+            self.trace_logger.log_step(
+                step_number=step_number,
+                tool=tool_name,
+                args=args,
+                start_perf=start_perf,
+                start_time_iso=start_time_iso,
+                status="success",
+                result=result,
+            )
+
+            return {
+                "step": step_number,
+                "tool": tool_name,
+                "args": args,
+                "result": result,
+            }
+
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {repr(e)}"
+            tb = traceback.format_exc()
+
+            self.trace_logger.log_step(
+                step_number=step_number,
+                tool=tool_name,
+                args=args,
+                start_perf=start_perf,
+                start_time_iso=start_time_iso,
+                status="error",
+                error=f"{error_text}\n{tb}",
+            )
+
+            return {
+                "step": step_number,
+                "tool": tool_name,
+                "args": args,
+                "error": f"{error_text}\n{tb}",
+            }
+
+    def _hitl_pause_for_bot_verification(self):
+        self.context["hitl_triggered"] = True
+        self.context["hitl_reason"] = "bot_verification"
+
+        print("\n" + "=" * 80)
+        print("HITL REQUIRED")
+        print("Bot verification detected in the browser.")
+        print("Please solve it manually in the opened browser window.")
+        print("After you finish, come back here and press Enter to continue.")
+        print("=" * 80 + "\n")
+
+        hitl_start = time.perf_counter()
+        input("Press Enter after completing the verification... ")
+        hitl_end = time.perf_counter()
+
+        self.context["hitl_resume_time_seconds"] = round(hitl_end - hitl_start, 4)
+
+    def _page(self):
+        return self.session.get_page()
+
+    def _wait_for_google_results(self, timeout_ms: int = 15000):
+        page = self._page()
+
+        possible_selectors = [
+            "a h3",
+            "div#search a h3",
+            "div.g a h3",
+            'a[href^="http"] h3',
+        ]
+
+        last_error = None
+        for selector in possible_selectors:
+            try:
+                page.wait_for_selector(selector, timeout=timeout_ms)
+                return selector
+            except Exception as e:
+                last_error = e
+
+        raise RuntimeError(f"Google results did not load. Last error: {last_error}")
+
+    def _extract_google_results(self, limit: int = 5) -> dict:
+        page = self._page()
+        anchors = page.locator("a:has(h3)")
+
+        try:
+            raw_count = anchors.count()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to count Google result anchors: {type(e).__name__}: {repr(e)}"
+            ) from e
+
+        count = min(raw_count, limit)
+        results = []
+
+        for i in range(count):
+            anchor = anchors.nth(i)
+
+            try:
+                title = anchor.locator("h3").inner_text().strip()
+            except Exception:
+                title = ""
+
+            try:
+                url = anchor.get_attribute("href")
+            except Exception:
+                url = None
+
+            if not title or not url:
+                continue
+            if url.startswith("/"):
+                continue
+            if "google.com" in url and "/url?" not in url:
+                continue
+
+            results.append(
+                {
+                    "title": title,
+                    "url": url,
+                }
+            )
+
+        return {"web": results}
+
+    def _click_first_google_result(self) -> dict:
+        page = self._page()
+        anchors = page.locator("a:has(h3)")
+
+        try:
+            count = anchors.count()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to inspect Google result anchors: {type(e).__name__}: {repr(e)}"
+            ) from e
+
+        if count == 0:
+            raise RuntimeError("No Google results available to click.")
+
+        clicked_url = None
+
+        for i in range(count):
+            anchor = anchors.nth(i)
+
+            try:
+                href = anchor.get_attribute("href")
+            except Exception:
+                href = None
+
+            if not href:
+                continue
+            if href.startswith("/"):
+                continue
+
+            try:
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=20000):
+                    anchor.click()
+                page.wait_for_load_state("networkidle", timeout=20000)
+                clicked_url = page.url
+                break
+            except Exception:
+                continue
+
+        if not clicked_url:
+            raise RuntimeError("Failed to click a usable Google result.")
+
+        self.context["playwright_final_url"] = clicked_url
+        return {"url": clicked_url}
+
+    def _open_url_visibly(self, url: str, source_number: int | None = None):
+        args = {"url": url}
+        if source_number is not None:
+            args["source_number"] = source_number
+
+        step_output = self._run_step(
+            0,
+            "open_result_url_headed",
+            args,
+            open_url_headed,
+            self.session,
+            url,
+        )
+        if "error" in step_output:
+            raise RuntimeError(step_output["error"])
+
+        page = self._page()
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(2000)
+
+        _ = self._run_step(
+            0,
+            "read_result_page_headed",
+            {"url": url, "max_chars": 1500},
+            read_page_headed,
+            self.session,
+            1500,
+        )
+
+        self.context["playwright_final_url"] = page.url
+        return {"url": page.url}
+
+    def _search_web_headed(self, query: str, limit: int = 5) -> dict:
+        normalized_query = normalize_search_query(query)
+
+        if self.llm_client:
+            try:
+                from reasoning_layer import optimize_query_with_llm
+
+                llm_query = optimize_query_with_llm(self.llm_client, query)
+                if llm_query.get("optimized_query"):
+                    normalized_query = llm_query["optimized_query"]
+                    self.context["query_optimizer_reasoning"] = llm_query.get(
+                        "reasoning", ""
+                    )
+            except Exception as e:
+                self.context["query_optimizer_error"] = (
+                    f"{type(e).__name__}: {repr(e)}"
+                )
+
+        step_output = self._run_step(
+            0,
+            "open_url_headed",
+            {"url": "https://www.google.com"},
+            open_url_headed,
+            self.session,
+            "https://www.google.com",
+        )
+        if "error" in step_output:
+            raise RuntimeError(step_output["error"])
+
+        step_output = self._run_step(
+            0,
+            "type_text_on_page",
+            {"selector": 'textarea[name="q"]', "text": normalized_query},
+            type_text_on_page,
+            self.session,
+            'textarea[name="q"]',
+            normalized_query,
+            25,
+            True,
+            True,
+        )
+        if "error" in step_output:
+            raise RuntimeError(step_output["error"])
+
+        self._page().wait_for_timeout(2000)
+
+        bot_check = self._run_step(
+            0,
+            "looks_like_bot_challenge",
+            {},
+            looks_like_bot_challenge,
+            self.session,
+        )
+        if "error" in bot_check:
+            raise RuntimeError(bot_check["error"])
+
+        bot_result = bot_check.get("result") or {}
+        if bot_result.get("is_bot_challenge"):
+            shot = self._run_step(
+                0,
+                "capture_screenshot",
+                {"path": "bot_challenge.png"},
+                capture_screenshot,
+                self.session,
+                "bot_challenge.png",
+            )
+            if "error" not in shot:
+                self.context["bot_challenge_screenshot"] = "bot_challenge.png"
+
+            self._hitl_pause_for_bot_verification()
+            self._page().wait_for_timeout(1500)
+
+        self._wait_for_google_results()
+
+        _ = self._run_step(
+            0,
+            "read_page_headed",
+            {"max_chars": 2500},
+            read_page_headed,
+            self.session,
+            2500,
+        )
+
+        results = self._extract_google_results(limit=limit)
+
+        if self.llm_client and results.get("web"):
+            try:
+                from reasoning_layer import rank_search_results_with_llm
+
+                ranking = rank_search_results_with_llm(
+                    self.llm_client,
+                    instruction=query,
+                    results=results["web"],
+                    max_select=min(3, len(results["web"])),
+                )
+
+                self.context["result_ranking_reasoning"] = ranking.get("reasoning", "")
+                self.context["selected_result_indices"] = ranking.get(
+                    "selected_indices", []
+                )
+
+                selected_items = []
+                for idx in ranking.get("selected_indices", []):
+                    if 1 <= idx <= len(results["web"]):
+                        selected_items.append(results["web"][idx - 1])
+
+                if selected_items:
+                    results["web"] = selected_items
+
+            except Exception as e:
+                self.context["result_ranking_error"] = (
+                    f"{type(e).__name__}: {repr(e)}"
+                )
+
+        self.context["last_search_result"] = results
+        self.context["last_search_query"] = normalized_query
+        self.context["original_instruction"] = query
+
+        return results
+
+    def _scrape_first_search_result_headed(self) -> dict:
+        search_result = self.context.get("last_search_result")
+        if not search_result:
+            raise ValueError("No previous search result found in context.")
+
+        first_url = extract_first_url_from_search_result(search_result)
+        if not first_url:
+            raise ValueError("Could not find first URL from headed search results.")
+
+        clicked = self._click_first_google_result()
+        final_url = clicked.get("url") or first_url
+
+        scrape_result = scrape_url(url=final_url)
+        markdown_text = get_markdown_from_result(scrape_result)
+
+        self.context["last_scraped_url"] = final_url
+        self.context["last_scrape_markdown"] = markdown_text
+
+        return scrape_result
+
+    def _scrape_top_search_results_headed(self, limit: int = 3) -> dict:
+        search_result = self.context.get("last_search_result")
+        if not search_result:
+            raise ValueError("No previous search result found in context.")
+
+        urls = extract_urls_from_search_result(search_result, limit=limit)
+        if not urls:
+            raise ValueError("Could not find usable URLs from search results.")
+
+        scraped_pages = []
+        combined_markdown_parts = []
+
+        for idx, url in enumerate(urls, start=1):
+            try:
+                visible_nav = self._open_url_visibly(url=url, source_number=idx)
+                final_visible_url = visible_nav.get("url") or url
+
+                scrape_result = scrape_url(url=final_visible_url)
+                markdown_text = get_markdown_from_result(scrape_result)
+
+                page_entry = {
+                    "url": final_visible_url,
+                    "markdown": markdown_text[:4000],
+                }
+
+                if markdown_text:
+                    page_entry["mini_summary"] = summarize_single_page(markdown_text)
+                    combined_markdown_parts.append(
+                        f"URL: {final_visible_url}\n{markdown_text}"
+                    )
+                else:
+                    page_entry["mini_summary"] = "No meaningful content found."
+
+                scraped_pages.append(page_entry)
+
+            except Exception as e:
+                scraped_pages.append(
+                    {
+                        "url": url,
+                        "error": f"{type(e).__name__}: {repr(e)}",
+                        "mini_summary": (
+                            f"Could not process source {idx}: "
+                            f"{type(e).__name__}: {repr(e)}"
+                        ),
+                    }
+                )
+
+        combined_markdown = "\n\n---\n\n".join(combined_markdown_parts)
+
+        self.context["scraped_pages"] = scraped_pages
+        self.context["page_summaries"] = [
+            {
+                "url": page.get("url"),
+                "mini_summary": page.get(
+                    "mini_summary", page.get("error", "No content available.")
+                ),
+            }
+            for page in scraped_pages
+        ]
+        self.context["last_scraped_urls"] = [
+            page.get("url") for page in scraped_pages if page.get("url")
+        ]
+        self.context["last_scraped_url"] = (
+            self.context["last_scraped_urls"][0]
+            if self.context["last_scraped_urls"]
+            else None
+        )
+        self.context["last_scrape_markdown"] = combined_markdown
+
+        return {
+            "scraped_count": len([p for p in scraped_pages if "markdown" in p]),
+            "pages": scraped_pages,
+        }
+
+    def _scrape_url_headed(self, url: str) -> dict:
+        self._open_url_visibly(url=url)
+        scrape_result = scrape_url(url=url)
+        markdown_text = get_markdown_from_result(scrape_result)
+
+        self.context["last_scraped_url"] = url
+        self.context["last_scrape_markdown"] = markdown_text
+
+        return scrape_result
+
+    def _summarize_last_scrape(self) -> str:
+        scraped_pages = self.context.get("scraped_pages")
+
+        if scraped_pages:
+            result = summarize_multi_page_results(scraped_pages)
+            self.context["page_summaries"] = [
+                {
+                    "url": page.get("url"),
+                    "mini_summary": page.get("mini_summary")
+                    if page.get("mini_summary")
+                    else (
+                        summarize_single_page(page.get("markdown", ""))
+                        if page.get("markdown")
+                        else page.get("error", "No content available.")
+                    ),
+                }
+                for page in scraped_pages
+            ]
+        else:
+            scraped_text = self.context.get("last_scrape_markdown", "")
+            result = summarize_text(scraped_text)
+
+        self.context["last_summary"] = result
+        return result
+
+    def _execute_tool(self, tool_name: str, args: dict) -> Any:
+        if tool_name == "search_web":
+            return self._search_web_headed(
+                query=args["query"],
+                limit=args.get("limit", 5),
+            )
+
+        if tool_name == "scrape_first_search_result":
+            return self._scrape_first_search_result_headed()
+
+        if tool_name == "scrape_top_search_results":
+            return self._scrape_top_search_results_headed(
+                limit=args.get("limit", 3)
+            )
+
+        if tool_name == "scrape_url":
+            return self._scrape_url_headed(url=args["url"])
+
+        if tool_name == "summarize_last_scrape":
+            return self._summarize_last_scrape()
+
+        if tool_name == "map_site":
+            return map_site(**args)
+
+        if tool_name == "crawl_site":
+            return crawl_site(**args)
+
+        if tool_name == "extract_structured":
+            return extract_structured(**args)
+
+        raise ValueError(f"Unknown tool: {tool_name}")
+
+    def run_plan(self, plan: list[dict]) -> dict[str, Any]:
+        outputs = []
+
+        try:
+            for i, step in enumerate(plan, start=1):
+                tool_name = step["tool"]
+                args = step.get("args", {})
+
+                start_perf = time.perf_counter()
+                start_time_iso = self.trace_logger.now_iso()
+
+                try:
+                    result = self._execute_tool(tool_name, args)
+
+                    outputs.append(
+                        {
+                            "step": i,
+                            "tool": tool_name,
+                            "args": args,
+                            "result": result,
+                        }
+                    )
+
+                    self.trace_logger.log_step(
+                        step_number=i,
+                        tool=tool_name,
+                        args=args,
+                        start_perf=start_perf,
+                        start_time_iso=start_time_iso,
+                        status="success",
+                        result=result,
+                    )
+
+                except Exception as e:
+                    error_text = f"{type(e).__name__}: {repr(e)}"
+                    tb = traceback.format_exc()
+
+                    self.trace_logger.log_step(
+                        step_number=i,
+                        tool=tool_name,
+                        args=args,
+                        start_perf=start_perf,
+                        start_time_iso=start_time_iso,
+                        status="error",
+                        error=f"{error_text}\n{tb}",
+                    )
+
+                    outputs.append(
+                        {
+                            "step": i,
+                            "tool": tool_name,
+                            "args": args,
+                            "error": f"{error_text}\n{tb}",
+                        }
+                    )
+                    break
+
+        finally:
+            try:
+                close_browser_headed(self.session)
+            except Exception:
+                pass
+
+        return {
+            "outputs": outputs,
+            "trace": self.trace_logger.to_dict(),
+            "context": self.context,
+        }
+
+    def run_google_search_flow(self):
+        """
+        Backward-compatible wrapper for older calling code.
+        """
+        plan = [
+            {
+                "tool": "search_web",
+                "args": {
+                    "query": self.instruction,
+                    "limit": 5,
+                },
+            },
+            {
+                "tool": "scrape_top_search_results",
+                "args": {
+                    "limit": 3,
+                },
+            },
+            {
+                "tool": "summarize_last_scrape",
+                "args": {},
+            },
+        ]
+        return self.run_plan(plan)
