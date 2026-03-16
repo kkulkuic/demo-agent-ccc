@@ -1,5 +1,5 @@
 """Tavily search helpers for benchmark use."""
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from langchain_core.tools import tool
 from tavily import TavilyClient
@@ -19,6 +19,7 @@ def tavily_search_raw(
     search_depth: str = "basic",
     topic: Optional[str] = None,
     max_results: int = 5,
+    include_answer: Optional[Union[bool, str]] = None,
 ) -> Dict[str, Any]:
     client = _get_tavily_client()
     params: Dict[str, Any] = {
@@ -28,6 +29,8 @@ def tavily_search_raw(
     }
     if topic:
         params["topic"] = topic
+    if include_answer is not None:
+        params["include_answer"] = include_answer
     return client.search(**params)  # type: ignore[arg-type]
 
 
