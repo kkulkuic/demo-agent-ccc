@@ -1,0 +1,5 @@
+browser,engine,success,captcha_detected,network_requests,screenshot,ttfb,dom_load,total_load,links,images,scripts
+Chromium,duckduckgo,True,False,57,research_results/Chromium_duckduckgo.jpg,0.492,0.492,0.545,1,2,20
+Brave,brave,True,False,439,research_results/Brave_brave.jpg,0.618,0.618,1.002,106,89,1
+Firefox,bing,True,False,314,research_results/Firefox_bing.jpg,0.395,0.395,1.113,87,3,14
+Edge,bing,True,False,456,research_results/Edge_bing.jpg,0.271,0.271,0.814,77,1,13

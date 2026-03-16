@@ -1,0 +1,58 @@
+[
+  {
+    "browser": "Chromium",
+    "engine": "duckduckgo",
+    "success": true,
+    "captcha_detected": false,
+    "network_requests": 57,
+    "screenshot": "research_results/Chromium_duckduckgo.jpg",
+    "ttfb": 0.492,
+    "dom_load": 0.492,
+    "total_load": 0.545,
+    "links": 1,
+    "images": 2,
+    "scripts": 20
+  },
+  {
+    "browser": "Brave",
+    "engine": "brave",
+    "success": true,
+    "captcha_detected": false,
+    "network_requests": 439,
+    "screenshot": "research_results/Brave_brave.jpg",
+    "ttfb": 0.618,
+    "dom_load": 0.618,
+    "total_load": 1.002,
+    "links": 106,
+    "images": 89,
+    "scripts": 1
+  },
+  {
+    "browser": "Firefox",
+    "engine": "bing",
+    "success": true,
+    "captcha_detected": false,
+    "network_requests": 314,
+    "screenshot": "research_results/Firefox_bing.jpg",
+    "ttfb": 0.395,
+    "dom_load": 0.395,
+    "total_load": 1.113,
+    "links": 87,
+    "images": 3,
+    "scripts": 14
+  },
+  {
+    "browser": "Edge",
+    "engine": "bing",
+    "success": true,
+    "captcha_detected": false,
+    "network_requests": 456,
+    "screenshot": "research_results/Edge_bing.jpg",
+    "ttfb": 0.271,
+    "dom_load": 0.271,
+    "total_load": 0.814,
+    "links": 77,
+    "images": 1,
+    "scripts": 13
+  }
+]
