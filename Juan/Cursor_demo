@@ -1,0 +1,116 @@
+import sys
+from playwright.sync_api import sync_playwright
+
+# Draw a visible dot cursor + click ripple inside the page.
+CURSOR_OVERLAY_JS = r"""
+(() => {
+  if (window.__pw_cursor_installed) return;
+  window.__pw_cursor_installed = true;
+
+  const c = document.createElement('div');
+  c.id = '__pw_cursor';
+  c.style.cssText = `
+    position: fixed;
+    left: 0; top: 0;
+    width: 18px; height: 18px;
+    background: red;
+    border-radius: 50%;
+    z-index: 2147483647;
+    pointer-events: none;
+    margin-left: -9px;
+    margin-top: -9px;
+    box-shadow: 0 0 0 3px rgba(255,0,0,0.35), 0 0 12px rgba(255,0,0,0.7);
+  `;
+  document.documentElement.appendChild(c);
+
+  const style = document.createElement('style');
+  style.textContent = `
+    @keyframes __pw_click {
+      from { opacity: 0.9; transform: scale(1); }
+      to   { opacity: 0.0; transform: scale(6); }
+    }
+  `;
+  document.documentElement.appendChild(style);
+
+  window.__pwCursorMove = (x, y) => {
+    c.style.left = x + 'px';
+    c.style.top  = y + 'px';
+  };
+
+  window.__pwCursorClick = (x, y) => {
+    const ring = document.createElement('div');
+    ring.style.cssText = `
+      position: fixed;
+      left:${x}px; top:${y}px;
+      width: 14px; height: 14px;
+      border: 3px solid red;
+      border-radius: 50%;
+      margin-left: -7px;
+      margin-top: -7px;
+      z-index: 2147483647;
+      pointer-events:none;
+      animation: __pw_click 450ms ease-out forwards;
+    `;
+    document.documentElement.appendChild(ring);
+    setTimeout(() => ring.remove(), 550);
+  };
+})();
+"""
+
+def ensure_cursor(page):
+    # Install on the current document AND park it somewhere visible immediately.
+    page.evaluate(CURSOR_OVERLAY_JS)
+    page.evaluate("() => window.__pwCursorMove && window.__pwCursorMove(200, 200)")
+
+def move_cursor(page, x, y, steps=15, pause_ms=60):
+    ensure_cursor(page)
+    page.mouse.move(x, y, steps=steps)
+    page.evaluate("([x,y]) => window.__pwCursorMove && window.__pwCursorMove(x,y)", [x, y])
+    page.wait_for_timeout(pause_ms)
+
+def click_cursor(page, x, y):
+    ensure_cursor(page)
+    page.mouse.click(x, y)
+    page.evaluate("([x,y]) => window.__pwCursorClick && window.__pwCursorClick(x,y)", [x, y])
+
+def main():
+    url = sys.argv[1] if len(sys.argv) > 1 else "https://www.wikipedia.org"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, slow_mo=80)
+        context = browser.new_context(viewport={"width": 1200, "height": 800})
+
+        # Persist overlay across navigations:
+        context.add_init_script(CURSOR_OVERLAY_JS)
+
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded")
+
+        # Force-install now (in case add_init_script hasn’t run yet for this doc)
+        ensure_cursor(page)
+
+        print("Overlay cursor installed:",
+              page.evaluate("() => !!document.getElementById('__pw_cursor')"))
+
+        page.wait_for_timeout(500)
+
+        # Move around the viewport (you should clearly see the dot)
+        points = [(150, 150), (600, 180), (900, 300), (700, 600), (250, 550), (150, 150)]
+        for (x, y) in points:
+            move_cursor(page, x, y)
+
+        # Click at a spot (you should see a ripple)
+        click_cursor(page, 600, 400)
+        page.wait_for_timeout(1200)
+
+        # Small “draw” motion
+        for i in range(30):
+            x = 200 + i * 20
+            y = 250 + (i % 10) * 12
+            move_cursor(page, x, y, steps=8, pause_ms=35)
+
+        page.wait_for_timeout(2000)
+        browser.close()
+
+if __name__ == "__main__":
+    main()
