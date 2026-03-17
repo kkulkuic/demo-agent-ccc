@@ -1,0 +1,698 @@
+r"""
+LangGraph + Playwright Demo (Headless / Headed) with Human-in-the-Loop + Benchmarking
+==================================================================================
+
+Goal:
+- Connect a LangGraph workflow to Playwright (browser automation)
+- Given a URL, extract:
+  1) Webpage title
+  2) Brief description (meta description, fallback to OpenGraph/Twitter, fallback to first paragraph)
+
+Sponsor-driven extensions in this file:
+1) Human-in-the-Loop (HITL):
+   - Uses LangGraph's `interrupt` feature to require user approval BEFORE scraping runs.
+2) Website Performance Analysis (Benchmark):
+   - Compare extraction success + timing for headless=True vs headless=False across URLs.
+3) Button Clicking + Form Filling helpers (headless-friendly):
+   - Utility functions that click buttons/links by visible text and fill fields by label/placeholder.
+
+How to run (Windows CMD):
+1) Activate venv:
+   .\.venv\Scripts\activate.bat
+2) Run a normal scrape (default headless=True):
+   python app.py https://example.com
+3) Run headed (shows browser window):
+   python app.py --headed https://example.com
+4) Run HITL (asks approval before each URL is scraped):
+   python app.py --hitl https://example.com
+5) Run benchmark (headless vs headed for each URL):
+   python app.py --benchmark https://example.com https://wikipedia.org
+
+Notes:
+- We do NOT bypass bot protection. We only detect and report clearly.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, TypedDict, Literal, NotRequired, Iterable, Any
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import MemorySaver
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+
+class State(TypedDict):
+    """
+    LangGraph State Object
+
+    This describes the "shape" of data passed between nodes.
+
+    Required:
+    - url: input URL
+
+    Outputs:
+    - title/description: extracted metadata (may be None if missing)
+    - error: error message string if something fails
+    - elapsed_ms: approximate time spent loading + extracting
+
+    Controls:
+    - headless: True (default) or False (headed)
+    - timeout_ms: navigation timeout
+    """
+    url: str
+    title: Optional[str]
+    description: Optional[str]
+    error: Optional[str]
+    elapsed_ms: NotRequired[Optional[int]]
+    headless: NotRequired[bool]
+    timeout_ms: NotRequired[int]
+    actions: NotRequired[list[dict[str, Any]]]
+    action_log: NotRequired[list[str]]
+
+
+def looks_like_bot_challenge(title: Optional[str], body_text: Optional[str]) -> bool:
+    """
+    Heuristic detector for bot/verification/consent interstitial pages.
+    We do NOT attempt to bypass these—only detect and report clearly.
+    """
+    hay = f"{title or ''} {body_text or ''}".lower()
+
+    keywords = [
+        "not a robot",
+        "verify you are human",
+        "verification",
+        "captcha",
+        "access denied",
+        "unusual traffic",
+        "just a moment",
+        "checking your browser",
+        "cloudflare",
+        "enable cookies",
+        "are you human",
+        "blocked",
+        "security check",
+        "interstitial",
+        "consent",
+    ]
+    return any(k in hay for k in keywords)
+
+
+# -----------------------------
+# Playwright helpers ("tools")
+# -----------------------------
+
+def click_button_by_text(page, text: str, timeout_ms: int = 5000) -> bool:
+    """
+    Click a button/link by its visible accessible name.
+
+    Tries robust selectors first (ARIA roles), then falls back to text locator.
+    Returns True if a click succeeded, otherwise False.
+    """
+    try:
+        page.get_by_role("button", name=text).click(timeout=timeout_ms)
+        return True
+    except Exception:
+        pass
+
+    try:
+        page.get_by_role("link", name=text).click(timeout=timeout_ms)
+        return True
+    except Exception:
+        pass
+
+    try:
+        page.locator(f"text={text}").first.click(timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+def fill_field(page, label_or_placeholder: str, value: str, timeout_ms: int = 5000) -> bool:
+    """
+    Fill an input by its label (best) or placeholder (fallback).
+    Returns True if fill succeeded, otherwise False.
+    """
+    try:
+        page.get_by_label(label_or_placeholder).fill(value, timeout=timeout_ms)
+        return True
+    except Exception:
+        pass
+
+    try:
+        page.get_by_placeholder(label_or_placeholder).fill(value, timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+# -----------------------------
+# Interaction helpers wired as a LangGraph node
+# -----------------------------
+
+def _run_actions(page, actions: Iterable[dict[str, Any]]) -> list[str]:
+    """Run a sequence of click/fill/wait actions on the given page."""
+    logs: list[str] = []
+    for i, act in enumerate(actions, start=1):
+        atype = str(act.get("type", "")).lower().strip()
+        try:
+            if atype == "click":
+                text = str(act.get("text", "")).strip()
+                ok = click_button_by_text(page, text)
+                logs.append(f"{i}. click '{text}' -> {ok}")
+            elif atype == "fill":
+                label = str(act.get("label", "")).strip()
+                value = str(act.get("value", ""))
+                ok = fill_field(page, label, value)
+                logs.append(f"{i}. fill '{label}' -> {ok}")
+            elif atype == "wait":
+                ms = int(act.get("ms", 800))
+                page.wait_for_timeout(ms)
+                logs.append(f"{i}. wait {ms}ms -> ok")
+            elif atype == "press":
+                selector = str(act.get("selector", "")).strip()
+                key = str(act.get("key", "")).strip()
+                page.locator(selector).press(key)
+                logs.append(f"{i}. press {key} on {selector} -> ok")
+            else:
+                logs.append(f"{i}. unknown action type '{atype}' -> skipped")
+        except Exception as e:
+            logs.append(f"{i}. action '{atype}' -> ERROR {type(e).__name__}: {e}")
+    return logs
+
+
+def fetch_with_actions(
+    url: str,
+    actions: Iterable[dict[str, Any]],
+    *,
+    timeout_ms: int = 20000,
+    headless: bool = True,
+) -> tuple[Optional[str], Optional[str], Optional[int], list[str]]:
+    """Navigate to url, optionally run actions, then extract title/description."""
+    import time
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+        action_log: list[str] = []
+        try:
+            t0 = time.perf_counter()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(500)
+
+            if actions:
+                action_log = _run_actions(page, actions)
+                # give the page a moment to update after interactions
+                page.wait_for_timeout(700)
+
+            title = page.title().strip() if page.title() else None
+
+            # small body sample for bot/consent detection
+            body_sample = ""
+            try:
+                body_sample = (page.inner_text("body") or "")[:2000]
+            except Exception:
+                body_sample = ""
+
+            if looks_like_bot_challenge(title, body_sample):
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                return None, None, elapsed_ms, action_log
+
+            # meta description + fallbacks (same logic as fetch_title_and_description)
+            desc: Optional[str] = None
+            try:
+                desc = page.eval_on_selector('meta[name="description"]', "el => el.getAttribute('content')")
+            except Exception:
+                desc = None
+
+            if not desc:
+                for sel in ('meta[property="og:description"]', 'meta[name="twitter:description"]'):
+                    try:
+                        desc = page.eval_on_selector(sel, "el => el.getAttribute('content')")
+                    except Exception:
+                        desc = None
+                    if desc:
+                        break
+
+            if not desc:
+                try:
+                    desc = page.eval_on_selector("p", "el => el.textContent") or None
+                except Exception:
+                    desc = None
+
+            if desc:
+                desc = " ".join(str(desc).split())[:240]
+
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            return title, desc, elapsed_ms, action_log
+        finally:
+            browser.close()
+
+
+def interact_node(state: State) -> State:
+    """LangGraph Node: 'interact' (runs click/fill actions in the browser, then extracts metadata)."""
+    url = state["url"]
+    actions = state.get("actions") or []
+    headless = bool(state.get("headless", True))
+    timeout_ms = int(state.get("timeout_ms", 20000))
+
+    try:
+        title, description, elapsed_ms, action_log = fetch_with_actions(
+            url,
+            actions,
+            timeout_ms=timeout_ms,
+            headless=headless,
+        )
+
+        if not title and not description:
+            return {
+                **state,
+                "title": None,
+                "description": None,
+                "elapsed_ms": elapsed_ms,
+                "action_log": action_log,
+                "error": "Interaction/extraction failed: page appears to be a bot/verification or consent interstitial (or metadata not available).",
+            }
+
+        return {
+            **state,
+            "title": title,
+            "description": description,
+            "elapsed_ms": elapsed_ms,
+            "action_log": action_log,
+            "error": None,
+        }
+    except PWTimeoutError:
+        return {
+            **state,
+            "title": None,
+            "description": None,
+            "elapsed_ms": None,
+            "action_log": [f"Timeout during interactions for: {url}"],
+            "error": f"Timeout loading/interacting: {url}",
+        }
+    except Exception as e:
+        return {
+            **state,
+            "title": None,
+            "description": None,
+            "elapsed_ms": None,
+            "action_log": [f"ERROR {type(e).__name__}: {e}"],
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def route_node(state: State) -> State:
+    """No-op node used as a branching point."""
+    return state
+
+
+def _route_after_approval(state: State) -> str:
+    """Route to interact if actions are present; otherwise route to scrape."""
+    actions = state.get("actions") or []
+    return "interact" if len(actions) > 0 else "scrape"
+
+
+def fetch_title_and_description(
+    url: str,
+    timeout_ms: int = 20000,
+    headless: bool = True,
+) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Playwright extraction tool (headless or headed)
+
+    Steps:
+    1) Launch Chromium
+    2) Navigate to the URL (with timeout)
+    3) Extract page <title>
+    4) Extract meta description:
+         <meta name="description" content="...">
+       Fallbacks:
+         og:description, twitter:description, then first <p>
+    5) Close browser cleanly.
+
+    Returns:
+      (title, description, elapsed_ms)
+
+      If the page looks like a verification wall, returns (None, None, elapsed_ms).
+    """
+    import time
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+
+        try:
+            t0 = time.perf_counter()
+
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+            # Small wait helps pages that set metadata right after hydration
+            page.wait_for_timeout(800)
+
+            # Extract title
+            title = page.title().strip() if page.title() else None
+
+            # Grab a small body text sample for interstitial detection
+            body_sample = ""
+            try:
+                body_sample = (page.inner_text("body") or "")[:2000]
+            except Exception:
+                body_sample = ""
+
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+            # If the page looks like a bot/consent wall, return empty metadata.
+            if looks_like_bot_challenge(title, body_sample):
+                return None, None, elapsed_ms
+
+            # Attempt 1: meta description
+            desc: Optional[str] = None
+            try:
+                desc = page.eval_on_selector(
+                    'meta[name="description"]',
+                    "el => el.getAttribute('content')",
+                )
+            except Exception:
+                desc = None
+
+            # Optional extra fallbacks (OpenGraph/Twitter)
+            if not desc:
+                for sel in ('meta[property="og:description"]', 'meta[name="twitter:description"]'):
+                    try:
+                        desc = page.eval_on_selector(sel, "el => el.getAttribute('content')")
+                    except Exception:
+                        desc = None
+                    if desc:
+                        break
+
+            # Attempt 2 (fallback): first paragraph text
+            if not desc:
+                try:
+                    desc = page.eval_on_selector("p", "el => el.textContent") or None
+                except Exception:
+                    desc = None
+
+            # Clean/shorten description for "brief" output
+            if desc:
+                desc = " ".join(desc.split())
+                desc = desc[:240]
+
+            return title, desc, elapsed_ms
+
+        finally:
+            browser.close()
+
+
+# -----------------------------
+# LangGraph nodes
+# -----------------------------
+
+def approval_node(state: State) -> Command[Literal["scrape", "end_rejected"]]:
+    """
+    HITL Gate:
+    Pause here and require human approval before scraping runs.
+    """
+    approved = interrupt(
+        {
+            "question": "Approve scraping this URL?",
+            "url": state["url"],
+            "note": "We only extract title + meta description (or brief paragraph fallback).",
+        }
+    )
+
+    if approved is True:
+        return Command(goto="route")
+    return Command(goto="end_rejected")
+
+
+def rejected_node(state: State) -> State:
+    return {
+        **state,
+        "title": None,
+        "description": None,
+        "elapsed_ms": None,
+        "error": "User rejected the run before scraping.",
+    }
+
+
+def scrape_node(state: State) -> State:
+    """
+    LangGraph Node: 'scrape'
+
+    Behavior:
+    - On success: fill in title/description and clear error
+    - On timeout: set error message
+    - On bot/verification/consent wall: set a clear error message
+    - On other errors: capture exception type + message in error
+    """
+    url = state["url"]
+    headless = state.get("headless", True)
+    timeout_ms = state.get("timeout_ms", 20000)
+
+    try:
+        title, description, elapsed_ms = fetch_title_and_description(
+            url, timeout_ms=timeout_ms, headless=headless
+        )
+
+        # Soft failure: likely verification wall OR no metadata available
+        if not title and not description:
+            return {
+                **state,
+                "title": None,
+                "description": None,
+                "elapsed_ms": elapsed_ms,
+                "error": "Extraction failed: page appears to be a bot/verification or consent interstitial (or metadata not available).",
+            }
+
+        return {
+            **state,
+            "title": title,
+            "description": description,
+            "elapsed_ms": elapsed_ms,
+            "error": None,
+        }
+
+    except PWTimeoutError:
+        return {
+            **state,
+            "title": None,
+            "description": None,
+            "elapsed_ms": None,
+            "error": f"Timeout loading: {url}",
+        }
+
+    except Exception as e:
+        return {
+            **state,
+            "title": None,
+            "description": None,
+            "elapsed_ms": None,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def build_graph(*, hitl: bool = False):
+    r"""
+    Build and compile the LangGraph workflow.
+
+    - If no actions are provided in state:
+        route -> scrape
+    - If actions are provided:
+        route -> interact
+
+    If hitl=False:
+      START -> route -> (scrape|interact) -> END
+
+    If hitl=True:
+      START -> approve (interrupt) -> route -> (scrape|interact) -> END
+                     \-> end_rejected -> END
+
+    IMPORTANT:
+    - HITL requires a checkpointer + thread_id so the graph can resume.
+    """
+    g = StateGraph(State)
+
+    # Core nodes
+    g.add_node("route", route_node)
+    g.add_node("scrape", scrape_node)
+    g.add_node("interact", interact_node)
+
+    # Conditional routing after "route"
+    g.add_conditional_edges(
+        "route",
+        _route_after_approval,
+        {
+            "scrape": "scrape",
+            "interact": "interact",
+        },
+    )
+
+    # Common terminal edges
+    g.add_edge("scrape", END)
+    g.add_edge("interact", END)
+
+    if hitl:
+        g.add_node("approve", approval_node)
+        g.add_node("end_rejected", rejected_node)
+        g.add_edge(START, "approve")
+        g.add_edge("approve", "route")
+        # approve node routes via Command(goto="route") or "end_rejected"
+        g.add_edge("end_rejected", END)
+
+        checkpointer = MemorySaver()
+        return g.compile(checkpointer=checkpointer)
+
+    # non-HITL (original behavior)
+    g.add_edge(START, "route")
+    return g.compile()
+
+
+# -----------------------------
+# Benchmarking
+# -----------------------------
+
+@dataclass
+class BenchRow:
+    url: str
+    mode: str  # "headless" or "headed"
+    ok: bool
+    elapsed_ms: Optional[int]
+    error: Optional[str]
+
+
+def run_benchmark(urls: list[str], timeout_ms: int = 20000) -> list[BenchRow]:
+    """
+    For each URL, run extraction in:
+    - headless=True
+    - headless=False
+    and collect success + timing.
+    """
+    app = build_graph(hitl=False)
+    rows: list[BenchRow] = []
+
+    for u in urls:
+        for headless in (True, False):
+            result = app.invoke(
+                {
+                    "url": u,
+                    "title": None,
+                    "description": None,
+                    "error": None,
+                    "headless": headless,
+                    "timeout_ms": timeout_ms,
+                }
+            )
+            ok = (result.get("error") is None) and bool(result.get("title") or result.get("description"))
+            rows.append(
+                BenchRow(
+                    url=u,
+                    mode="headless" if headless else "headed",
+                    ok=ok,
+                    elapsed_ms=result.get("elapsed_ms"),
+                    error=result.get("error"),
+                )
+            )
+    return rows
+
+
+def print_benchmark(rows: list[BenchRow]) -> None:
+    """
+    Pretty-print benchmark output and a small summary.
+    """
+    from collections import defaultdict
+
+    print("\n=== Benchmark Results (headless vs headed) ===\n")
+
+    for r in rows:
+        status = "OK " if r.ok else "BAD"
+        print(f"[{status}] {r.mode:8}  {r.elapsed_ms if r.elapsed_ms is not None else '-':>6} ms  {r.url}")
+        if r.error:
+            print(f"       error: {r.error}")
+
+    # Summary
+    by_mode = defaultdict(list)
+    for r in rows:
+        by_mode[r.mode].append(r)
+
+    print("\n--- Summary ---")
+    for mode, items in by_mode.items():
+        total = len(items)
+        ok = sum(1 for x in items if x.ok)
+        times = [x.elapsed_ms for x in items if x.ok and isinstance(x.elapsed_ms, int)]
+        avg = int(sum(times) / len(times)) if times else None
+        print(f"{mode:8}: {ok}/{total} success  |  avg elapsed: {avg if avg is not None else '-'} ms")
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def _ask_yes_no(prompt: str) -> bool:
+    ans = input(prompt).strip().lower()
+    return ans in ("y", "yes")
+
+
+if __name__ == "__main__":
+    import sys
+
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: python app.py [--headed] [--hitl] [--benchmark] <url1> [url2] ...")
+        raise SystemExit(1)
+
+    headed = "--headed" in args
+    hitl = "--hitl" in args
+    benchmark = "--benchmark" in args
+
+    # Remove flags
+    flags = {"--headed", "--hitl", "--benchmark"}
+    urls = [a for a in args if a not in flags]
+
+    if not urls:
+        print("Error: Provide at least one URL.")
+        raise SystemExit(1)
+
+    if benchmark:
+        rows = run_benchmark(urls)
+        print_benchmark(rows)
+        raise SystemExit(0)
+
+    app = build_graph(hitl=hitl)
+
+    # HITL needs a thread_id to resume after an interrupt
+    config = {"configurable": {"thread_id": "cli-thread-1"}} if hitl else None
+
+    for u in urls:
+        payload: State = {
+            "url": u,
+            "title": None,
+            "description": None,
+            "error": None,
+            "headless": (not headed),
+        }
+
+        if not hitl:
+            result = app.invoke(payload)
+        else:
+            result = app.invoke(payload, config=config)
+
+            # If interrupted, ask the user and resume
+            if "__interrupt__" in result:
+                intr = result["__interrupt__"][0].value
+                print(f"\nHITL: {intr.get('question')}  {intr.get('url')}")
+                approved = _ask_yes_no("Approve? (y/n): ")
+
+                result = app.invoke(Command(resume=approved), config=config)
+
+        print("\nURL:", result["url"])
+        print("TITLE:", result.get("title"))
+        print("DESC :", result.get("description"))
+        print("TIME :", result.get("elapsed_ms"), "ms")
+        if result.get("action_log"):
+            print("ACTIONS:")
+            for line in result["action_log"]:
+                print("  -", line)
+        print("ERROR:", result.get("error"))
