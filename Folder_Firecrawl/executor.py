@@ -1,90 +1,9 @@
 import re
 import time
-from typing import Any, Optional
+from typing import Any
 
 from telemetry import TraceLogger
-from tools.firecrawl_tools import (
-    search_web,
-    scrape_url,
-    map_site,
-    crawl_site,
-    extract_structured,
-)
-
-
-def get_markdown_from_result(result) -> str:
-    if hasattr(result, "markdown"):
-        return result.markdown or ""
-    if isinstance(result, dict):
-        return result.get("markdown", "") or ""
-    return ""
-
-
-def extract_first_url_from_search_result(search_result) -> Optional[str]:
-    if not search_result:
-        return None
-
-    if hasattr(search_result, "web") and getattr(search_result, "web", None):
-        first_item = search_result.web[0]
-        if isinstance(first_item, dict):
-            return first_item.get("url")
-        return getattr(first_item, "url", None)
-
-    if isinstance(search_result, dict):
-        web_results = search_result.get("web", [])
-        if web_results:
-            first_item = web_results[0]
-            if isinstance(first_item, dict):
-                return first_item.get("url")
-            return getattr(first_item, "url", None)
-
-    return None
-
-
-def extract_urls_from_search_result(search_result, limit: int = 3) -> list[str]:
-    urls = []
-
-    if not search_result:
-        return urls
-
-    items = []
-    if hasattr(search_result, "web") and getattr(search_result, "web", None):
-        items = search_result.web
-    elif isinstance(search_result, dict):
-        items = search_result.get("web", [])
-
-    for item in items:
-        if isinstance(item, dict):
-            url = item.get("url")
-        else:
-            url = getattr(item, "url", None)
-
-        if url and url not in urls:
-            urls.append(url)
-
-        if len(urls) >= limit:
-            break
-
-    return urls
-
-
-def is_supported_scrape_url(url: str) -> bool:
-    if not url:
-        return False
-
-    blocked_domains = [
-        "facebook.com",
-        "m.facebook.com",
-        "instagram.com",
-        "tiktok.com",
-        "x.com",
-        "twitter.com",
-        "linkedin.com",
-        "pinterest.com",
-    ]
-
-    lower = url.lower()
-    return not any(domain in lower for domain in blocked_domains)
+from tools.firecrawl_tools import search_web, crawl_site_map
 
 
 def normalize_search_query(query: str) -> str:
@@ -93,247 +12,556 @@ def normalize_search_query(query: str) -> str:
 
     cleaned = query.strip()
 
-    patterns = [
-        r"^\s*scrape\s+top\s+result\s+of\s+",
-        r"^\s*scrape\s+all\s+info\s+on\s+",
-        r"^\s*scrape\s+all\s+information\s+on\s+",
-        r"^\s*scrape\s+information\s+on\s+",
-        r"^\s*scrape\s+info\s+on\s+",
-        r"^\s*scrape\s+",
-        r"^\s*search\s+all\s+results\s+of\s+",
-        r"^\s*search\s+for\s+",
-        r"^\s*search\s+",
-        r"^\s*find\s+information\s+on\s+",
-        r"^\s*find\s+info\s+on\s+",
-        r"^\s*find\s+",
-        r"^\s*look\s+up\s+",
-        r"^\s*gather\s+information\s+on\s+",
-        r"^\s*get\s+information\s+on\s+",
+    m = re.match(
+        r"^\s*what\s+does\s+wikipedia\s+say\s+about\s+(.+)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        topic = m.group(1).strip(" .,:;?!")
+        cleaned = f"{topic} Wikipedia"
+        if "-filetype:pdf" not in cleaned.lower():
+            cleaned += " -filetype:pdf"
+        return cleaned
+
+    lower = cleaned.lower()
+
+    domain_match = re.search(r"\b([a-zA-Z0-9-]+\.[a-zA-Z]{2,})\b", cleaned)
+    domain = domain_match.group(1) if domain_match else None
+
+    if domain:
+        if "pricing" in lower and "faq" in lower:
+            return f"site:{domain} pricing faq business model -filetype:pdf"
+
+        if "returns" in lower:
+            return f"site:{domain} returns return policy -filetype:pdf"
+
+        if "documentation" in lower or "docs" in lower:
+            if "state graph" in lower or "stategraph" in lower:
+                return f"site:{domain} state graph documentation code example -filetype:pdf"
+            return f"site:{domain} documentation docs -filetype:pdf"
+
+        if "login" in lower:
+            return f"site:{domain} login -filetype:pdf"
+
+        if "url" in lower or "urls" in lower:
+            return f"site:{domain} documentation urls -filetype:pdf"
+
+    filler_patterns = [
+        r"\bcrawl\b",
+        r"\bscrape\b",
+        r"\bsearch\b",
+        r"\bfind\b",
+        r"\blook up\b",
+        r"\bgo to\b",
+        r"\bextract\b",
+        r"\bsummarize\b",
+        r"\bmap out\b",
+        r"\bidentify\b",
+        r"\breturn\b",
+        r"\bentire\b",
+        r"\ball\b",
+        r"\bsection\b",
+        r"\bsections\b",
+        r"\bpage\b",
+        r"\bpages\b",
+        r"\bsite\b",
+        r"\bwebsite\b",
+        r"\binto markdown\b",
+        r"\binto json\b",
+        r"[\"']",
     ]
 
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    working = lower
+    for pattern in filler_patterns:
+        working = re.sub(pattern, " ", working, flags=re.IGNORECASE)
 
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;")
+    stopwords = {
+        "the",
+        "and",
+        "of",
+        "for",
+        "from",
+        "on",
+        "a",
+        "an",
+        "to",
+        "all",
+        "their",
+        "its",
+        "with",
+        "that",
+        "which",
+        "ones",
+        "found",
+        "available",
+        "major",
+    }
+
+    tokens = re.findall(r"[a-zA-Z0-9_-]+", working)
+
+    filtered_tokens = []
+    for token in tokens:
+        if token in stopwords:
+            continue
+        if domain and token in domain.lower():
+            continue
+        if len(token) <= 1:
+            continue
+        filtered_tokens.append(token)
+
+    seen = set()
+    keywords = []
+    for token in filtered_tokens:
+        if token not in seen:
+            seen.add(token)
+            keywords.append(token)
+
+    if domain:
+        priority_terms = []
+        for term in [
+            "pricing",
+            "faq",
+            "returns",
+            "return",
+            "documentation",
+            "docs",
+            "stategraph",
+            "state",
+            "graph",
+            "code",
+            "example",
+            "login",
+            "business",
+            "model",
+            "urls",
+        ]:
+            if term in keywords:
+                priority_terms.append(term)
+
+        other_terms = [k for k in keywords if k not in priority_terms]
+        final_terms = (priority_terms + other_terms)[:8]
+        cleaned = f"site:{domain} " + " ".join(final_terms)
+    else:
+        cleaned = " ".join(keywords[:10])
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if cleaned and "-filetype:pdf" not in cleaned.lower():
+        cleaned += " -filetype:pdf"
+
     return cleaned or query.strip()
 
 
-def strip_markdown_noise(text: str) -> str:
+def extract_domain_from_text(text: str) -> str | None:
     if not text:
-        return ""
-
-    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
-    text = re.sub(r"\[([^\]]+)\]\((.*?)\)", r"\1", text)
-    text = re.sub(r"#+", "", text)
-    text = text.replace("\r", "")
-    return text
+        return None
+    match = re.search(r"\b([a-zA-Z0-9-]+\.[a-zA-Z]{2,})\b", text)
+    return match.group(1).lower() if match else None
 
 
-def extract_main_content(text: str) -> str:
-    if not text:
-        return ""
+def extract_search_items(search_result) -> list[dict]:
+    if not search_result:
+        return []
 
-    cleaned = strip_markdown_noise(text)
+    items = []
+    raw_items = []
 
-    generic_markers = [
-        "Main content",
-        "Overview",
-        "Introduction",
-        "Crash Facts",
-        "Crash Data",
-        "Safety",
-        "Reports",
-        "Statistics",
-        "Travel",
-        "Maps",
-    ]
+    if hasattr(search_result, "web") and getattr(search_result, "web", None):
+        raw_items = search_result.web
+    elif isinstance(search_result, dict):
+        raw_items = search_result.get("web", [])
 
-    for marker in generic_markers:
-        idx = cleaned.find(marker)
-        if idx != -1:
-            return cleaned[idx:]
+    for item in raw_items:
+        if isinstance(item, dict):
+            url = (item.get("url") or "").strip()
+            title = (item.get("title") or "").strip()
+            description = (item.get("description") or "").strip()
+        else:
+            url = (getattr(item, "url", "") or "").strip()
+            title = (getattr(item, "title", "") or "").strip()
+            description = (getattr(item, "description", "") or "").strip()
 
-    return cleaned
-
-
-def clean_summary_lines(lines: list[str]) -> list[str]:
-    junk_prefixes = (
-        "skip to main content",
-        "search...",
-        "ctrl k",
-        "navigation",
-        "get started",
-        "playground",
-        "blog",
-        "community",
-        "changelog",
-        "on this page",
-        "ready to build?",
-        "start for free",
-        "see our plans",
-    )
-
-    junk_phrases = (
-        "what can",
-        "why ",
-        "use firecrawl with",
-        "scrape your first",
-        "quickstart",
-        "documentation",
-        "sdk",
-        "integrations",
-        "api reference",
-        "toggle search",
-        "agency header search",
-    )
-
-    junk_exact = {
-        "v2",
-        "english",
-        "new features",
-        "standard features",
-        "developer guides",
-        "webhooks",
-        "use cases",
-        "contributing",
-        "resources",
-        "search",
-        "menu",
-        "navigation",
-        "home",
-    }
-
-    cleaned = []
-    seen = set()
-
-    for line in lines:
-        line = re.sub(r"^[-•\s]+", "", line.strip()).strip()
-
-        if not line or len(line) < 3:
+        if not url:
             continue
 
-        lower = line.lower()
-
-        if lower in junk_exact:
-            continue
-
-        if any(lower.startswith(prefix) for prefix in junk_prefixes):
-            continue
-
-        if any(phrase in lower for phrase in junk_phrases):
-            continue
-
-        if lower in seen:
-            continue
-
-        seen.add(lower)
-        cleaned.append(line)
-
-    return cleaned
-
-
-def summarize_single_page(text: str, max_chars: int = 4000) -> str:
-    if not text:
-        return "No meaningful content found."
-
-    main_content = extract_main_content(text)[:max_chars]
-    raw_lines = [line.strip() for line in main_content.splitlines() if line.strip()]
-    filtered_lines = clean_summary_lines(raw_lines)
-
-    if not filtered_lines:
-        return "No meaningful content found."
-
-    title_line = filtered_lines[0]
-    useful_lines = []
-
-    for line in filtered_lines[1:]:
-        lower = line.lower()
-
-        if len(line) < 20:
-            continue
-        if line.endswith(":") and len(line) < 40:
-            continue
-        if lower in {"search", "menu", "navigation", "home", "english"}:
-            continue
-
-        useful_lines.append(line)
-
-    bullets = []
-    seen = set()
-
-    for line in useful_lines:
-        norm = line.lower().strip()
-        if norm in seen:
-            continue
-        seen.add(norm)
-
-        if 30 <= len(line) <= 220:
-            bullets.append(line)
-
-        if len(bullets) == 3:
-            break
-
-    summary = f"Topic: {title_line}\n"
-    if bullets:
-        summary += "Highlights:\n"
-        for bullet in bullets:
-            summary += f"- {bullet}\n"
-
-    return summary.strip()
-
-
-def summarize_multi_page_results(scraped_pages: list[dict]) -> str:
-    if not scraped_pages:
-        return "No scraped pages available to summarize."
-
-    source_summaries = []
-
-    for idx, page in enumerate(scraped_pages, start=1):
-        url = page.get("url", "Unknown URL")
-
-        if page.get("error"):
-            source_summaries.append(
-                {
-                    "source_number": idx,
-                    "url": url,
-                    "summary": f"Source {idx} could not be summarized because scraping failed: {page['error']}",
-                }
-            )
-            continue
-
-        markdown = page.get("markdown", "")
-        mini_summary = summarize_single_page(markdown)
-
-        source_summaries.append(
+        items.append(
             {
-                "source_number": idx,
                 "url": url,
-                "summary": mini_summary,
+                "title": title,
+                "description": description,
             }
         )
 
-    lines = []
-    lines.append("Multi-source summary:\n")
-
-    for item in source_summaries:
-        lines.append(f"Source {item['source_number']}: {item['url']}")
-        lines.append(item["summary"])
-        lines.append("")
-
-    return "\n".join(lines).strip()
+    return items
 
 
-def summarize_text(text: str, max_chars: int = 6000) -> str:
-    if not text:
-        return "No content available to summarize."
+def is_pdf_url(url: str) -> bool:
+    if not url:
+        return False
+    lower = url.lower()
+    return lower.endswith(".pdf") or ".pdf?" in lower
 
-    return summarize_single_page(text, max_chars=max_chars)
+
+def extract_domain(url: str) -> str:
+    match = re.search(r"https?://([^/]+)", (url or "").lower())
+    return match.group(1) if match else (url or "").lower()
+
+
+def domain_matches(url: str, domain: str) -> bool:
+    """
+    Allow the exact domain and any subdomain.
+    Example:
+      domain=langchain.com
+      matches langchain.com, docs.langchain.com, python.langchain.com
+    """
+    host = extract_domain(url)
+    domain = (domain or "").lower().strip()
+
+    if not host or not domain:
+        return False
+
+    return host == domain or host.endswith("." + domain)
+
+
+def score_search_item(item: dict, query: str) -> int:
+    score = 0
+    q_words = set(re.findall(r"\w+", (query or "").lower()))
+
+    title = (item.get("title") or "").lower()
+    description = (item.get("description") or "").lower()
+    url = (item.get("url") or "").lower()
+
+    for word in q_words:
+        if len(word) < 3:
+            continue
+        if word in title:
+            score += 3
+        elif word in description:
+            score += 2
+        elif word in url:
+            score += 1
+
+    if title:
+        score += 1
+    if description:
+        score += 1
+
+    if "docs" in url or "documentation" in url:
+        score += 3
+    if "/api" in url or "developer" in url:
+        score += 2
+
+    if is_pdf_url(url):
+        score -= 100
+
+    return score
+
+
+def rank_and_filter_search_results(
+    search_result,
+    original_query: str,
+    max_results: int = 8,
+) -> list[dict]:
+    items = extract_search_items(search_result)
+
+    if not items:
+        return []
+
+    seen_urls = set()
+    unique_items = []
+
+    for item in items:
+        url = item["url"]
+        if is_pdf_url(url):
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        unique_items.append(item)
+
+    ranked = sorted(
+        unique_items,
+        key=lambda x: score_search_item(x, original_query),
+        reverse=True,
+    )
+
+    final_items = []
+    domain_counts = {}
+
+    for item in ranked:
+        domain = extract_domain(item["url"])
+        domain_counts.setdefault(domain, 0)
+
+        if domain_counts[domain] >= 3:
+            continue
+
+        final_items.append(item)
+        domain_counts[domain] += 1
+
+        if len(final_items) >= max_results:
+            break
+
+    return final_items
+
+
+def summarize_search_results_only(
+    search_result,
+    query: str,
+    llm_client=None,
+    max_results: int = 8,
+) -> str:
+    ranked_items = rank_and_filter_search_results(
+        search_result=search_result,
+        original_query=query,
+        max_results=max_results,
+    )
+
+    if not ranked_items:
+        return "No useful non-PDF search results were found."
+
+    if llm_client:
+        try:
+            result_text = "\n\n".join(
+                f"Title: {item['title']}\nDescription: {item['description']}\nURL: {item['url']}"
+                for item in ranked_items
+            )
+
+            response = llm_client.messages.create(
+                model="claude-3-5-sonnet-latest",
+                max_tokens=350,
+                temperature=0.2,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarize these search results into a concise but informative answer. "
+                            "Use only the titles and descriptions provided. "
+                            "Prioritize official documentation or primary sources when present. "
+                            "List the most relevant URLs first if appropriate. "
+                            "Do not say you scraped or opened the websites. "
+                            "Do not invent details not present in the search results.\n\n"
+                            f"User query: {query}\n\n"
+                            f"{result_text}"
+                        ),
+                    }
+                ],
+            )
+
+            if response.content and len(response.content) > 0:
+                return response.content[0].text.strip()
+        except Exception:
+            pass
+
+    lines = [f"Summary based on top search results for: {query}\n"]
+    for idx, item in enumerate(ranked_items, start=1):
+        title = item["title"] or "Untitled result"
+        desc = item["description"] or "No description available."
+        url = item["url"]
+        lines.append(f"{idx}. {title} — {desc} ({url})")
+
+    return "\n".join(lines)
+
+
+def normalize_crawl_query(query: str) -> dict:
+    original = (query or "").strip()
+    lower = original.lower()
+    domain = extract_domain_from_text(original)
+
+    if not domain:
+        raise ValueError("Could not detect a domain for crawl mode.")
+
+    include_patterns = []
+    if any(term in lower for term in ["doc", "documentation", "api", "developer"]):
+        include_patterns.extend(["docs", "documentation", "api", "developer"])
+    if "pricing" in lower:
+        include_patterns.extend(["pricing", "plans"])
+    if "faq" in lower or "help" in lower:
+        include_patterns.extend(["faq", "help"])
+    if "build" in lower or "apps" in lower:
+        include_patterns.extend(["apps", "build", "developer"])
+
+    return {
+        "domain": domain,
+        "seed_url": f"https://{domain}",
+        "include_patterns": list(dict.fromkeys(include_patterns)),
+    }
+
+
+def flatten_crawl_urls(crawl_result) -> list[str]:
+    if not crawl_result:
+        return []
+
+    if isinstance(crawl_result, dict):
+        raw_urls = (
+            crawl_result.get("urls")
+            or crawl_result.get("links")
+            or crawl_result.get("results")
+            or []
+        )
+    else:
+        raw_urls = getattr(crawl_result, "urls", None) or getattr(crawl_result, "links", None) or []
+
+    urls = []
+    for item in raw_urls:
+        if isinstance(item, str):
+            url = item.strip()
+        elif isinstance(item, dict):
+            url = (item.get("url") or item.get("link") or "").strip()
+        else:
+            url = (getattr(item, "url", "") or getattr(item, "link", "") or "").strip()
+
+        if url:
+            urls.append(url)
+
+    seen = set()
+    deduped = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            deduped.append(url)
+
+    return deduped
+
+
+def classify_url(url: str) -> str:
+    u = (url or "").lower()
+    host = extract_domain(url)
+
+    if host.startswith("docs.") or "/docs" in u or "/documentation" in u:
+        return "documentation"
+    if host.startswith("api.") or "/api" in u or "developer" in u:
+        return "api/developer"
+    if "/apps" in u or "/build" in u:
+        return "apps/build"
+    if "/pricing" in u or "/plans" in u:
+        return "pricing"
+    if "/faq" in u or "/help" in u or "/support" in u:
+        return "faq/help"
+    if "/blog" in u:
+        return "blog"
+    if "/login" in u or "/signin" in u or "/account" in u:
+        return "account"
+    if "forum." in host or "/forum" in u or "/community" in u:
+        return "community/forum"
+    return "other"
+
+
+def filter_crawl_urls(urls: list[str], domain: str, limit: int = 50) -> list[dict]:
+    filtered = []
+    for url in urls:
+        if not domain_matches(url, domain):
+            continue
+        if is_pdf_url(url):
+            continue
+        filtered.append(
+            {
+                "url": url,
+                "category": classify_url(url),
+            }
+        )
+
+    preferred_order = {
+        "documentation": 0,
+        "api/developer": 1,
+        "apps/build": 2,
+        "pricing": 3,
+        "faq/help": 4,
+        "other": 5,
+        "blog": 6,
+        "community/forum": 7,
+        "account": 8,
+    }
+
+    filtered = sorted(
+        filtered,
+        key=lambda x: (preferred_order.get(x["category"], 99), x["url"]),
+    )
+
+    seen = set()
+    deduped = []
+    for item in filtered:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+
+    return deduped
+
+
+def summarize_crawl_results_only(
+    crawl_items: list[dict],
+    domain: str,
+    query: str,
+    llm_client=None,
+    max_results: int = 20,
+) -> str:
+    if not crawl_items:
+        return f"No useful URLs were discovered for {domain}."
+
+    top_items = crawl_items[:max_results]
+
+    if llm_client:
+        try:
+            crawl_text = "\n".join(
+                f"- [{item['category']}] {item['url']}"
+                for item in top_items
+            )
+
+            response = llm_client.messages.create(
+                model="claude-3-5-sonnet-latest",
+                max_tokens=400,
+                temperature=0.2,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarize these discovered site URLs. "
+                            "Group them by likely category such as documentation, api/developer, apps/build, pricing, or faq/help. "
+                            "Use only the URLs provided. "
+                            "Do not claim you extracted page content. "
+                            "Keep the answer concise and structured.\n\n"
+                            f"User query: {query}\n"
+                            f"Domain: {domain}\n\n"
+                            f"{crawl_text}"
+                        ),
+                    }
+                ],
+            )
+
+            if response.content and len(response.content) > 0:
+                return response.content[0].text.strip()
+        except Exception:
+            pass
+
+    grouped = {}
+    for item in top_items:
+        grouped.setdefault(item["category"], []).append(item["url"])
+
+    lines = [f"Discovered URLs for {domain}:"]
+    for category, urls in grouped.items():
+        lines.append(f"\n{category.upper()}:")
+        for url in urls[:8]:
+            lines.append(f"- {url}")
+
+    return "\n".join(lines)
 
 
 class AgentExecutor:
-    def __init__(self, instruction: str, mode: str = "firecrawl_headless"):
+    def __init__(
+        self,
+        instruction: str,
+        mode: str = "firecrawl_headless",
+        llm_client=None,
+    ):
         self.trace_logger = TraceLogger(instruction=instruction, mode=mode)
-        self.context = {}
+        self.context = {
+            "original_instruction": instruction,
+            "mode": mode,
+        }
+        self.llm_client = llm_client
 
     def _log_success(
         self,
@@ -376,137 +604,123 @@ class AgentExecutor:
     def _execute_tool(self, tool_name: str, args: dict) -> Any:
         if tool_name == "search_web":
             cleaned_args = dict(args)
-            cleaned_args["query"] = normalize_search_query(args.get("query", ""))
+            cleaned_query = normalize_search_query(args.get("query", ""))
+            cleaned_args["query"] = cleaned_query
+
+            print(f"[DEBUG] Firecrawl query: {cleaned_query}")
+
+            tool_start = time.perf_counter()
             result = search_web(**cleaned_args)
+            tool_elapsed = round(time.perf_counter() - tool_start, 4)
+
+            raw_items = extract_search_items(result)
+            ranked_items = rank_and_filter_search_results(
+                search_result=result,
+                original_query=cleaned_query,
+                max_results=args.get("limit", 25),
+            )
+
             self.context["last_search_result"] = result
-            self.context["last_search_query"] = cleaned_args["query"]
-            return result
-
-        if tool_name == "scrape_url":
-            result = scrape_url(**args)
-            markdown_text = get_markdown_from_result(result)
-            self.context["last_scrape_markdown"] = markdown_text
-            self.context["last_scraped_url"] = args.get("url")
-            return result
-
-        if tool_name == "map_site":
-            return map_site(**args)
-
-        if tool_name == "crawl_site":
-            return crawl_site(**args)
-
-        if tool_name == "extract_structured":
-            return extract_structured(**args)
-
-        if tool_name == "scrape_first_search_result":
-            search_result = self.context.get("last_search_result")
-            if not search_result:
-                raise ValueError("No previous search result found in context.")
-
-            urls = extract_urls_from_search_result(search_result, limit=10)
-            if not urls:
-                raise ValueError("Could not find usable URLs from search results.")
-
-            chosen_url = None
-            for url in urls:
-                if is_supported_scrape_url(url):
-                    chosen_url = url
-                    break
-
-            if not chosen_url:
-                raise ValueError("No supported URLs found in search results.")
-
-            result = scrape_url(url=chosen_url)
-            markdown_text = get_markdown_from_result(result)
-
-            self.context["last_scraped_url"] = chosen_url
-            self.context["last_scrape_markdown"] = markdown_text
-            return result
-
-        if tool_name == "scrape_top_search_results":
-            search_result = self.context.get("last_search_result")
-            if not search_result:
-                raise ValueError("No previous search result found in context.")
-
-            urls = extract_urls_from_search_result(
-                search_result,
-                limit=args.get("limit", 3),
+            self.context["last_search_query"] = cleaned_query
+            self.context["search_response_time_seconds"] = tool_elapsed
+            self.context["raw_result_count"] = len(raw_items)
+            self.context["filtered_result_count"] = len(ranked_items)
+            self.context["returned_urls"] = [item["url"] for item in ranked_items]
+            self.context["returned_domains"] = sorted(
+                list({extract_domain(item["url"]) for item in ranked_items})
             )
-            if not urls:
-                raise ValueError("Could not find usable URLs from search results.")
+            self.context["results_preview"] = ranked_items[:5]
 
-            scraped_pages = []
-            combined_markdown_parts = []
+            return result
 
-            for url in urls:
-                if not is_supported_scrape_url(url):
-                    scraped_pages.append(
-                        {
-                            "url": url,
-                            "error": "Unsupported or blocked domain for scraping.",
-                        }
-                    )
-                    continue
+        if tool_name == "summarize_search_results":
+            search_result = self.context.get("last_search_result")
+            query = self.context.get("last_search_query", "")
 
-                try:
-                    result = scrape_url(url=url)
-                    markdown_text = get_markdown_from_result(result)
-
-                    scraped_pages.append(
-                        {
-                            "url": url,
-                            "markdown": markdown_text[:4000],
-                        }
-                    )
-
-                    if markdown_text:
-                        combined_markdown_parts.append(f"URL: {url}\n{markdown_text}")
-
-                except Exception as e:
-                    scraped_pages.append(
-                        {
-                            "url": url,
-                            "error": str(e),
-                        }
-                    )
-
-            combined_markdown = "\n\n---\n\n".join(combined_markdown_parts)
-
-            self.context["scraped_pages"] = scraped_pages
-            self.context["last_scraped_urls"] = [
-                p.get("url") for p in scraped_pages if p.get("markdown")
-            ]
-            self.context["last_scraped_url"] = (
-                self.context["last_scraped_urls"][0]
-                if self.context["last_scraped_urls"]
-                else None
+            tool_start = time.perf_counter()
+            result = summarize_search_results_only(
+                search_result=search_result,
+                query=query,
+                llm_client=self.llm_client,
+                max_results=args.get("limit", 8),
             )
-            self.context["last_scrape_markdown"] = combined_markdown
-
-            return {
-                "scraped_count": len([p for p in scraped_pages if "markdown" in p]),
-                "pages": scraped_pages,
-            }
-
-        if tool_name == "summarize_last_scrape":
-            scraped_pages = self.context.get("scraped_pages")
-
-            if scraped_pages:
-                result = summarize_multi_page_results(scraped_pages)
-                self.context["page_summaries"] = [
-                    {
-                        "url": page.get("url"),
-                        "mini_summary": summarize_single_page(page.get("markdown", ""))
-                        if page.get("markdown")
-                        else page.get("error", "No content available."),
-                    }
-                    for page in scraped_pages
-                ]
-            else:
-                scraped_text = self.context.get("last_scrape_markdown", "")
-                result = summarize_text(scraped_text)
+            tool_elapsed = round(time.perf_counter() - tool_start, 4)
 
             self.context["last_summary"] = result
+            self.context["summary_response_time_seconds"] = tool_elapsed
+            self.context["summary_length_chars"] = len(result or "")
+
+            return result
+
+        if tool_name == "crawl_site_map":
+            crawl_config = normalize_crawl_query(args.get("query", ""))
+            domain = crawl_config["domain"]
+
+            print(f"[DEBUG] Firecrawl crawl domain: {domain}")
+            print(f"[DEBUG] Firecrawl crawl include patterns: {crawl_config['include_patterns']}")
+
+            tool_start = time.perf_counter()
+            result = crawl_site_map(
+                url=crawl_config["seed_url"],
+                limit=args.get("limit", 50),
+            )
+            tool_elapsed = round(time.perf_counter() - tool_start, 4)
+
+            raw_urls = flatten_crawl_urls(result)
+            filtered_urls = filter_crawl_urls(
+                urls=raw_urls,
+                domain=domain,
+                limit=args.get("limit", 50),
+            )
+
+            include_patterns = crawl_config["include_patterns"]
+            if include_patterns:
+                preferred = []
+                others = []
+                for item in filtered_urls:
+                    u = item["url"].lower()
+                    if any(p in u for p in include_patterns):
+                        preferred.append(item)
+                    else:
+                        others.append(item)
+                filtered_urls = preferred + others
+
+            categories = {}
+            for item in filtered_urls:
+                categories[item["category"]] = categories.get(item["category"], 0) + 1
+
+            self.context["last_crawl_result"] = result
+            self.context["last_crawl_query"] = args.get("query", "")
+            self.context["crawl_domain"] = domain
+            self.context["crawl_seed_url"] = crawl_config["seed_url"]
+            self.context["crawl_response_time_seconds"] = tool_elapsed
+            self.context["crawl_raw_url_count"] = len(raw_urls)
+            self.context["crawl_filtered_url_count"] = len(filtered_urls)
+            self.context["crawl_urls"] = [item["url"] for item in filtered_urls]
+            self.context["crawl_items"] = filtered_urls
+            self.context["crawl_category_counts"] = categories
+
+            return result
+
+        if tool_name == "summarize_crawl_results":
+            crawl_items = self.context.get("crawl_items", [])
+            domain = self.context.get("crawl_domain", "")
+            query = self.context.get("last_crawl_query", "")
+
+            tool_start = time.perf_counter()
+            result = summarize_crawl_results_only(
+                crawl_items=crawl_items,
+                domain=domain,
+                query=query,
+                llm_client=self.llm_client,
+                max_results=args.get("limit", 20),
+            )
+            tool_elapsed = round(time.perf_counter() - tool_start, 4)
+
+            self.context["last_summary"] = result
+            self.context["crawl_summary_response_time_seconds"] = tool_elapsed
+            self.context["summary_length_chars"] = len(result or "")
+
             return result
 
         raise ValueError(f"Unknown tool: {tool_name}")
