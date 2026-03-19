@@ -3,7 +3,7 @@ from core.firecrawl_client import FirecrawlClient
 _fc = FirecrawlClient()
 
 
-def search_web(query: str, limit: int = 5):
+def search_web(query: str, limit: int = 25):
     return _fc.search(query=query, limit=limit)
 
 
@@ -17,6 +17,15 @@ def map_site(url: str, limit: int = 20):
 
 def crawl_site(url: str, limit: int = 10):
     return _fc.crawl_site(url=url, limit=limit)
+
+
+def crawl_site_map(url: str, limit: int = 50):
+    """
+    Sponsor-safe crawl helper:
+    returns discovered URLs from Firecrawl's site mapping capability
+    without extracting page content.
+    """
+    return _fc.map_site(url=url, limit=limit)
 
 
 def extract_structured(prompt: str, urls: list[str] | None = None):
