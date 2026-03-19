@@ -14,6 +14,8 @@ except ImportError:
 
 load_dotenv()
 
+SPONSOR_SEARCH_ONLY_MODE = True
+
 
 def build_llm_client():
     """
@@ -125,6 +127,44 @@ def pretty_print_result(result):
                 print(f"\nSource {idx}: {item.get('url')}")
                 print(item.get("mini_summary", ""))
 
+        print("\n" + "=" * 80)
+        print("EVALUATION METRICS")
+        print("=" * 80)
+
+        if "search_response_time_seconds" in context:
+            print("Search response time (s):", context["search_response_time_seconds"])
+
+        if "summary_response_time_seconds" in context:
+            print("Summary response time (s):", context["summary_response_time_seconds"])
+
+        if "raw_result_count" in context:
+            print("Raw results found:", context["raw_result_count"])
+
+        if "filtered_result_count" in context:
+            print("Filtered results kept:", context["filtered_result_count"])
+
+        if "returned_urls" in context:
+            print("Returned URLs:")
+            for url in context["returned_urls"]:
+                print(" -", url)
+
+        if "returned_domains" in context:
+            print("Unique domains:", len(context["returned_domains"]))
+            print("Domains:")
+            for domain in context["returned_domains"]:
+                print(" -", domain)
+
+        if "results_preview" in context:
+            print("\nTop Results Preview:")
+            for idx, item in enumerate(context["results_preview"], start=1):
+                print(f"\nResult {idx}")
+                print(" Title:", item.get("title", ""))
+                print(" URL:", item.get("url", ""))
+                print(" Description:", item.get("description", ""))
+
+        if "summary_length_chars" in context:
+            print("Summary length (chars):", context["summary_length_chars"])
+
         if "last_summary" in context:
             print("\nFinal Agent Answer:")
             print(context["last_summary"])
@@ -132,28 +172,59 @@ def pretty_print_result(result):
 
 def main():
     instruction = input("Enter instruction: ").strip()
-    mode = input("Enter mode (headless/hybrid): ").strip().lower()
 
+    llm_client = build_llm_client()
     plan = plan_actions(instruction)
 
     print("\nPlanned actions:")
     print(json.dumps(plan, indent=2))
 
-    llm_client = build_llm_client()
+    if SPONSOR_SEARCH_ONLY_MODE:
+        mode = input(
+            "\nEnter sponsor search-only mode (firecrawl_headless/firecrawl_headed): "
+        ).strip().lower()
 
-    if mode == "hybrid":
-        runner = HybridRunner(
+        if mode not in {"firecrawl_headless", "firecrawl_headed"}:
+            print("Invalid mode. Defaulting to firecrawl_headless.")
+            mode = "firecrawl_headless"
+
+        print(f"\nRunning in sponsor search-only mode using {mode}.")
+        print("No browser navigation. No scraping. Firecrawl search + summary only.")
+
+        executor = AgentExecutor(
             instruction=instruction,
+            mode=mode,
             llm_client=llm_client,
         )
-        result = runner.run_plan(plan)
-        pretty_print_result(result)
-        save_trace(runner.trace_logger, "latest_run_trace.json")
-    else:
-        executor = AgentExecutor(instruction=instruction)
         result = executor.run_plan(plan)
         pretty_print_result(result)
         save_trace(executor.trace_logger, "latest_run_trace.json")
+    else:
+        mode = input(
+            "Enter mode (firecrawl_headless/firecrawl_headed/hybrid): "
+        ).strip().lower()
+
+        if mode == "hybrid":
+            runner = HybridRunner(
+                instruction=instruction,
+                llm_client=llm_client,
+            )
+            result = runner.run_plan(plan)
+            pretty_print_result(result)
+            save_trace(runner.trace_logger, "latest_run_trace.json")
+        else:
+            if mode not in {"firecrawl_headless", "firecrawl_headed"}:
+                print("Invalid mode. Defaulting to firecrawl_headless.")
+                mode = "firecrawl_headless"
+
+            executor = AgentExecutor(
+                instruction=instruction,
+                mode=mode,
+                llm_client=llm_client,
+            )
+            result = executor.run_plan(plan)
+            pretty_print_result(result)
+            save_trace(executor.trace_logger, "latest_run_trace.json")
 
     print("\nSaved trace to latest_run_trace.json")
 
