@@ -201,17 +201,16 @@ To track TruLens internal costs, you would need to either:
 - Configure LiteLLM callbacks to log token usage
 - Use a custom TruLens provider that wraps token tracking
 
-### 2. Groundedness score range varies
-TruLens's `groundedness_measure_with_cot_reasons` returns scores in 0–1 range, but the actual float values depend on how the NLI model decomposes the answer into statements. Scores like 0.667 (2/3), 0.75 (3/4), 0.889 (8/9) are common because the answer is split into N statements and the score = (supported_statements / total_statements). This means groundedness is more granular but also more variable than a simple 0-3 scale.
+### 2. "I don't know" inflates groundedness scores
+TruLens's NLI-based groundedness checks whether the answer is logically entailed by the context. An answer like "I don't have enough information to answer this" is technically **fully grounded** (G=1.0) because it makes no falsifiable claims. This means an adapter that returns empty/irrelevant results will still score well on groundedness — the LLM just says "I can't answer" and gets a perfect groundedness score. This makes groundedness a **misleading metric when comparing search adapter quality**, because adapters that return nothing score just as well as adapters that return good results.
+
+A more meaningful metric in this context would be **answer coverage** — did the adapter return enough relevant context for the LLM to actually answer the question? Groundedness alone doesn't capture this.
 
 ### 3. Context relevance score is a 0-3 integer normalized to 0-1
 The `context_relevance` function returns a tuple `(float, dict)` where the float is already normalized to 0-1 (derived from a 0-3 integer score in the reason dict). This means you can only get 4 possible raw relevance values: 0.0, 0.33, 0.67, 1.0 — there's no granularity between these levels.
 
 ### 4. Firecrawl returns raw page content, not structured snippets
 Firecrawl's search endpoint returns the full page content in the `content` field, not structured `title/url/description` like other search engines. This makes the context very long and noisy, which likely hurts relevance scores. A better approach would be to use Firecrawl's `scrape` endpoint with content extraction, or truncate aggressively.
-
-### 5. Exa API key validity
-The Exa API key used in this evaluation may have usage limits. The 402 Payment Required error observed during earlier runs suggests the account may need to be upgraded for higher volume.
 
 ### 6. RAG chain is minimal
 The evaluation uses a bare-bones RAG chain: search results → context → LLM → answer. There is no:
@@ -225,10 +224,6 @@ This means the scores reflect raw search adapter quality, not the full potential
 ### 7. Only 9 evaluation queries
 The benchmark uses 9 hand-picked queries. This is too small for statistical significance. A production evaluation would need 50–100+ queries across diverse categories with human-annotated ground truth.
 
-### 10. "I don't know" inflates groundedness scores
-TruLens's NLI-based groundedness checks whether the answer is logically entailed by the context. An answer like "I don't have enough information to answer this" is technically **fully grounded** (G=1.0) because it makes no falsifiable claims. This means an adapter that returns empty/irrelevant results will still score well on groundedness — the LLM just says "I can't answer" and gets a perfect groundedness score. This makes groundedness a **misleading metric when comparing search adapter quality**, because adapters that return nothing score just as well as adapters that return good results.
-
-A more meaningful metric in this context would be **answer coverage** — did the adapter return enough relevant context for the LLM to actually answer the question? Groundedness alone doesn't capture this.
 
 ### 11. Single judge model
 All scores come from one judge model (Claude Haiku 4.5). Different judge models might give different scores. A more robust evaluation would use multiple judges and report inter-rater reliability.
