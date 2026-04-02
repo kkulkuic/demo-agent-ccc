@@ -16,6 +16,9 @@ from tools.headed_tools import (
     close_browser_headed,
     looks_like_bot_challenge,
     capture_screenshot,
+    click_on_page,
+    type_text_on_page,
+    get_current_url,
 )
 
 load_dotenv()
@@ -197,12 +200,17 @@ class HybridRunner:
     """
     Firecrawl-first hybrid runner.
 
-    Flow:
+    Core flow:
     1. Firecrawl search
     2. Rank/filter results
     3. Open best URL in headed browser
     4. Read page visibly
-    5. Summarize from result metadata + opened page content
+    5. Optional interactive actions:
+       - click_on_page
+       - type_text_on_page
+       - capture_screenshot
+       - get_current_url
+    6. Summarize from result metadata + opened page content
     """
 
     def __init__(self, instruction: str, slow_mo: int = 150, llm_client=None):
@@ -375,6 +383,19 @@ class HybridRunner:
         best = items[0]
         url = best["url"]
 
+        return self._open_url_common(url=url, selected_result=best)
+
+    def _open_url_direct(self, url: str) -> dict:
+        return self._open_url_common(
+            url=url,
+            selected_result={
+                "url": url,
+                "title": "",
+                "description": "",
+            },
+        )
+
+    def _open_url_common(self, url: str, selected_result: dict | None = None) -> dict:
         step_output = self._run_step(
             0,
             "open_url_headed",
@@ -385,6 +406,10 @@ class HybridRunner:
         )
         if "error" in step_output:
             raise RuntimeError(step_output["error"])
+
+        open_result = step_output.get("result") or {}
+        if not open_result.get("ok", False):
+            raise RuntimeError(open_result.get("error", f"Failed to open URL: {url}"))
 
         self._page().wait_for_timeout(2000)
 
@@ -420,17 +445,17 @@ class HybridRunner:
             page_title = ""
 
         self.context["selected_url"] = url
-        self.context["selected_result"] = best
+        self.context["selected_result"] = selected_result or {"url": url}
         self.context["opened_in_browser"] = True
         self.context["page_title"] = page_title
 
         return {
             "opened_url": url,
             "page_title": page_title,
-            "selected_result": best,
+            "selected_result": selected_result or {"url": url},
         }
 
-    def _read_opened_page(self, max_chars: int = 5000) -> str:
+    def _read_opened_page(self, max_chars: int = 5000) -> dict:
         if not self.context.get("opened_in_browser"):
             raise RuntimeError("No page has been opened in the browser yet.")
 
@@ -445,9 +470,125 @@ class HybridRunner:
         if "error" in step_output:
             raise RuntimeError(step_output["error"])
 
-        page_text = step_output.get("result") or ""
-        self.context["opened_page_text"] = page_text[:max_chars]
-        return self.context["opened_page_text"]
+        page_result = step_output.get("result") or {}
+        if not page_result.get("ok", False):
+            raise RuntimeError(page_result.get("error", "Could not read opened page."))
+
+        self.context["opened_page_text"] = (page_result.get("body_sample") or "")[:max_chars]
+        self.context["page_title"] = page_result.get("title", self.context.get("page_title", ""))
+        self.context["selected_url"] = page_result.get("url", self.context.get("selected_url", ""))
+
+        return page_result
+
+    def _click_on_page(self, target: str, show_viz: bool = True) -> dict:
+        if not self.context.get("opened_in_browser"):
+            raise RuntimeError("No page has been opened in the browser yet.")
+
+        step_output = self._run_step(
+            0,
+            "click_on_page",
+            {"target": target, "show_viz": show_viz},
+            click_on_page,
+            self.session,
+            target,
+            show_viz,
+        )
+        if "error" in step_output:
+            raise RuntimeError(step_output["error"])
+
+        result = step_output.get("result") or {}
+        if not result.get("ok", False):
+            raise RuntimeError(result.get("error", f"Failed to click target: {target}"))
+
+        self.context["last_click_target"] = target
+        self.context["last_action"] = "click_on_page"
+        self.context["selected_url"] = result.get("url", self.context.get("selected_url", ""))
+        self.context["page_title"] = result.get("title", self.context.get("page_title", ""))
+        self.context["opened_page_text"] = result.get("body_sample", self.context.get("opened_page_text", ""))
+
+        return result
+
+    def _type_text_on_page(
+        self,
+        selector: str,
+        text: str,
+        delay_ms: int = 25,
+        press_enter: bool = False,
+        show_viz: bool = True,
+    ) -> dict:
+        if not self.context.get("opened_in_browser"):
+            raise RuntimeError("No page has been opened in the browser yet.")
+
+        step_output = self._run_step(
+            0,
+            "type_text_on_page",
+            {
+                "selector": selector,
+                "text": text,
+                "delay_ms": delay_ms,
+                "press_enter": press_enter,
+                "show_viz": show_viz,
+            },
+            type_text_on_page,
+            self.session,
+            selector,
+            text,
+            delay_ms,
+            press_enter,
+            show_viz,
+        )
+        if "error" in step_output:
+            raise RuntimeError(step_output["error"])
+
+        result = step_output.get("result") or {}
+        if not result.get("ok", False):
+            raise RuntimeError(
+                result.get("error", f"Failed to type text into selector: {selector}")
+            )
+
+        self.context["last_typed_selector"] = selector
+        self.context["last_typed_text"] = text
+        self.context["last_action"] = "type_text_on_page"
+        self.context["selected_url"] = result.get("url", self.context.get("selected_url", ""))
+        self.context["page_title"] = result.get("title", self.context.get("page_title", ""))
+        self.context["opened_page_text"] = result.get("body_sample", self.context.get("opened_page_text", ""))
+
+        return result
+
+    def _get_current_url(self) -> dict:
+        step_output = self._run_step(
+            0,
+            "get_current_url",
+            {},
+            get_current_url,
+            self.session,
+        )
+        if "error" in step_output:
+            raise RuntimeError(step_output["error"])
+
+        result = step_output.get("result") or {}
+        if result.get("ok", False):
+            self.context["selected_url"] = result.get("url", self.context.get("selected_url", ""))
+
+        return result
+
+    def _capture_screenshot(self, path: str = "headed_step.png") -> dict:
+        step_output = self._run_step(
+            0,
+            "capture_screenshot",
+            {"path": path},
+            capture_screenshot,
+            self.session,
+            path,
+        )
+        if "error" in step_output:
+            raise RuntimeError(step_output["error"])
+
+        result = step_output.get("result") or {}
+        if result.get("ok", False):
+            self.context["last_screenshot_path"] = result.get("path", path)
+
+        return result
 
     def _summarize_opened_page(
         self,
@@ -464,7 +605,7 @@ class HybridRunner:
         page_text = (self.context.get("opened_page_text") or "")[:max_page_chars]
         selected = self.context.get("selected_result") or {}
         selected_title = selected.get("title", "")
-        selected_url = selected.get("url", "")
+        selected_url = self.context.get("selected_url", selected.get("url", ""))
 
         if self.llm_client:
             try:
@@ -532,9 +673,37 @@ class HybridRunner:
         if tool_name == "open_best_search_result":
             return self._open_best_search_result()
 
+        if tool_name == "open_url_direct":
+            return self._open_url_direct(
+                url=args["url"],
+            )
+
         if tool_name == "read_opened_page":
             return self._read_opened_page(
                 max_chars=args.get("max_chars", 5000),
+            )
+
+        if tool_name == "click_on_page":
+            return self._click_on_page(
+                target=args["target"],
+                show_viz=args.get("show_viz", True),
+            )
+
+        if tool_name == "type_text_on_page":
+            return self._type_text_on_page(
+                selector=args["selector"],
+                text=args["text"],
+                delay_ms=args.get("delay_ms", 25),
+                press_enter=args.get("press_enter", False),
+                show_viz=args.get("show_viz", True),
+            )
+
+        if tool_name == "get_current_url":
+            return self._get_current_url()
+
+        if tool_name == "capture_screenshot":
+            return self._capture_screenshot(
+                path=args.get("path", "headed_step.png"),
             )
 
         if tool_name == "summarize_opened_page":
