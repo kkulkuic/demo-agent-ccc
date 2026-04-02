@@ -6,8 +6,21 @@ def plan_actions(
 ):
     lower = instruction.lower().strip()
 
-    # Use crawl only when the user is clearly asking for broad URL discovery
-    # across a domain, not just docs/API identification.
+    def has_any(terms: list[str]) -> bool:
+        return any(term in lower for term in terms)
+
+    def extract_after_phrase(phrases: list[str]) -> str | None:
+        for phrase in phrases:
+            idx = lower.find(phrase)
+            if idx != -1:
+                value = instruction[idx + len(phrase):].strip(" :,-")
+                if value:
+                    return value
+        return None
+
+    # ------------------------------------------------------------------
+    # Existing crawl / discovery logic
+    # ------------------------------------------------------------------
     strong_crawl_terms = [
         "crawl the site",
         "crawl this site",
@@ -27,8 +40,6 @@ def plan_actions(
         "all pages on this site",
     ]
 
-    # These should still use search first because search is better at finding
-    # the important official docs/API hubs before crawl gets noisy.
     search_first_discovery_terms = [
         "map out the urls",
         "map out urls",
@@ -49,9 +60,6 @@ def plan_actions(
         "docs pages",
     ]
 
-    # Freshness / recency-sensitive prompts.
-    # These should search, but the executor should preserve the original intent
-    # and later rank/filter using freshness and source preferences.
     freshness_terms = [
         "latest",
         "most recent",
@@ -103,8 +111,59 @@ def plan_actions(
         "developer",
     ]
 
-    use_strong_crawl = any(term in lower for term in strong_crawl_terms)
-    if use_strong_crawl:
+    # ------------------------------------------------------------------
+    # NEW: direct browser / interaction logic
+    # ------------------------------------------------------------------
+    open_direct_terms = [
+        "open ",
+        "go to ",
+        "visit ",
+        "navigate to ",
+    ]
+
+    read_page_terms = [
+        "read this page",
+        "read the page",
+        "open and read",
+        "open the page",
+        "open website",
+        "open the site",
+        "visit the site",
+    ]
+
+    click_terms = [
+        "click ",
+        "press ",
+        "select ",
+        "tap ",
+    ]
+
+    type_terms = [
+        "type ",
+        "enter ",
+        "search for ",
+        "fill in ",
+        "put ",
+    ]
+
+    screenshot_terms = [
+        "screenshot",
+        "capture screenshot",
+        "take a screenshot",
+        "save screenshot",
+    ]
+
+    current_url_terms = [
+        "current url",
+        "what url am i on",
+        "where am i",
+        "get current url",
+    ]
+
+    # ------------------------------------------------------------------
+    # 1. Strong crawl mode
+    # ------------------------------------------------------------------
+    if has_any(strong_crawl_terms):
         return [
             {
                 "tool": "crawl_site_map",
@@ -121,10 +180,10 @@ def plan_actions(
             },
         ]
 
-    use_search_first_discovery = any(
-        term in lower for term in search_first_discovery_terms
-    )
-    if use_search_first_discovery:
+    # ------------------------------------------------------------------
+    # 2. Search-first discovery mode
+    # ------------------------------------------------------------------
+    if has_any(search_first_discovery_terms):
         return [
             {
                 "tool": "search_web",
@@ -143,11 +202,217 @@ def plan_actions(
             },
         ]
 
-    use_freshness = any(term in lower for term in freshness_terms)
-    use_reddit = any(term in lower for term in reddit_terms)
-    use_news = any(term in lower for term in news_terms)
+    # ------------------------------------------------------------------
+    # 3. Click action after open
+    # Example: "search for OpenAI and click pricing"
+    # ------------------------------------------------------------------
+    if has_any(click_terms) and ("search" in lower or "find" in lower or "look up" in lower):
+        click_target = extract_after_phrase(["click ", "press ", "select ", "tap "]) or ""
+        return [
+            {
+                "tool": "search_web",
+                "args": {
+                    "query": instruction,
+                    "limit": search_limit,
+                    "search_profile": "general_search",
+                },
+            },
+            {
+                "tool": "open_best_search_result",
+                "args": {},
+            },
+            {
+                "tool": "read_opened_page",
+                "args": {
+                    "max_chars": 4000,
+                },
+            },
+            {
+                "tool": "click_on_page",
+                "args": {
+                    "target": click_target,
+                    "show_viz": True,
+                },
+            },
+            {
+                "tool": "read_opened_page",
+                "args": {
+                    "max_chars": 4000,
+                },
+            },
+            {
+                "tool": "summarize_opened_page",
+                "args": {
+                    "max_results": summary_limit,
+                    "max_page_chars": 3500,
+                },
+            },
+        ]
 
-    # Reddit recent discussion search
+    # ------------------------------------------------------------------
+    # 4. Type/search-box action after open
+    # Example: "open google and type Playwright"
+    # ------------------------------------------------------------------
+    if has_any(type_terms) and has_any(open_direct_terms + read_page_terms):
+        typed_text = extract_after_phrase(["type ", "enter ", "search for ", "fill in ", "put "]) or ""
+        url = extract_after_phrase(["open ", "go to ", "visit ", "navigate to "]) or ""
+
+        if not url.startswith("http") and "." in url:
+            url = f"https://{url}"
+        elif not url:
+            url = "https://www.google.com"
+
+        return [
+            {
+                "tool": "open_url_direct",
+                "args": {
+                    "url": url,
+                },
+            },
+            {
+                "tool": "read_opened_page",
+                "args": {
+                    "max_chars": 3000,
+                },
+            },
+            {
+                "tool": "type_text_on_page",
+                "args": {
+                    "selector": "textarea[name='q'], input[name='q']",
+                    "text": typed_text,
+                    "delay_ms": 25,
+                    "press_enter": True,
+                    "show_viz": True,
+                },
+            },
+            {
+                "tool": "read_opened_page",
+                "args": {
+                    "max_chars": 4000,
+                },
+            },
+            {
+                "tool": "summarize_opened_page",
+                "args": {
+                    "max_results": summary_limit,
+                    "max_page_chars": 3500,
+                },
+            },
+        ]
+
+    # ------------------------------------------------------------------
+    # 5. Direct open + click
+    # Example: "open wikipedia.org and click English"
+    # ------------------------------------------------------------------
+    if has_any(click_terms) and has_any(open_direct_terms):
+        click_target = extract_after_phrase(["click ", "press ", "select ", "tap "]) or ""
+        url = extract_after_phrase(["open ", "go to ", "visit ", "navigate to "]) or ""
+
+        if url and not url.startswith("http") and "." in url:
+            url = f"https://{url}"
+
+        return [
+            {
+                "tool": "open_url_direct",
+                "args": {
+                    "url": url,
+                },
+            },
+            {
+                "tool": "read_opened_page",
+                "args": {
+                    "max_chars": 3000,
+                },
+            },
+            {
+                "tool": "click_on_page",
+                "args": {
+                    "target": click_target,
+                    "show_viz": True,
+                },
+            },
+            {
+                "tool": "read_opened_page",
+                "args": {
+                    "max_chars": 4000,
+                },
+            },
+            {
+                "tool": "summarize_opened_page",
+                "args": {
+                    "max_results": summary_limit,
+                    "max_page_chars": 3500,
+                },
+            },
+        ]
+
+    # ------------------------------------------------------------------
+    # 6. Direct open + read
+    # ------------------------------------------------------------------
+    if has_any(open_direct_terms) or has_any(read_page_terms):
+        url = extract_after_phrase(["open ", "go to ", "visit ", "navigate to "]) or ""
+
+        if url and not url.startswith("http") and "." in url:
+            url = f"https://{url}"
+
+        if url:
+            return [
+                {
+                    "tool": "open_url_direct",
+                    "args": {
+                        "url": url,
+                    },
+                },
+                {
+                    "tool": "read_opened_page",
+                    "args": {
+                        "max_chars": 5000,
+                    },
+                },
+                {
+                    "tool": "summarize_opened_page",
+                    "args": {
+                        "max_results": summary_limit,
+                        "max_page_chars": 3500,
+                    },
+                },
+            ]
+
+    # ------------------------------------------------------------------
+    # 7. Screenshot current page
+    # ------------------------------------------------------------------
+    if has_any(screenshot_terms):
+        return [
+            {
+                "tool": "capture_screenshot",
+                "args": {
+                    "path": "headed_step.png",
+                },
+            },
+            {
+                "tool": "get_current_url",
+                "args": {},
+            },
+        ]
+
+    # ------------------------------------------------------------------
+    # 8. Current URL only
+    # ------------------------------------------------------------------
+    if has_any(current_url_terms):
+        return [
+            {
+                "tool": "get_current_url",
+                "args": {},
+            }
+        ]
+
+    # ------------------------------------------------------------------
+    # 9. Reddit recent discussion search
+    # ------------------------------------------------------------------
+    use_freshness = has_any(freshness_terms)
+    use_reddit = has_any(reddit_terms)
+    use_news = has_any(news_terms)
+
     if use_reddit and (use_freshness or "shopify returns" in lower):
         return [
             {
@@ -167,7 +432,9 @@ def plan_actions(
             },
         ]
 
-    # News / current events search
+    # ------------------------------------------------------------------
+    # 10. News / current events
+    # ------------------------------------------------------------------
     if use_news or (use_freshness and "top 5" in lower):
         return [
             {
@@ -187,7 +454,9 @@ def plan_actions(
             },
         ]
 
-    # Generic recent/fresh search
+    # ------------------------------------------------------------------
+    # 11. Generic recent/fresh search
+    # ------------------------------------------------------------------
     if use_freshness:
         return [
             {
@@ -207,8 +476,22 @@ def plan_actions(
             },
         ]
 
-    use_search = any(term in lower for term in search_terms)
-    if use_search:
+    # ------------------------------------------------------------------
+    # 12. General search + open best result
+    # Better than only search/summarize if user likely wants browsing
+    # ------------------------------------------------------------------
+    use_search = has_any(search_terms)
+    browse_like_terms = [
+        "open",
+        "visit",
+        "website",
+        "site",
+        "page",
+        "show me",
+        "go to",
+    ]
+
+    if use_search or has_any(browse_like_terms):
         return [
             {
                 "tool": "search_web",
@@ -219,15 +502,27 @@ def plan_actions(
                 },
             },
             {
-                "tool": "summarize_search_results",
+                "tool": "open_best_search_result",
+                "args": {},
+            },
+            {
+                "tool": "read_opened_page",
                 "args": {
-                    "limit": summary_limit,
-                    "summary_profile": "general_search",
+                    "max_chars": 5000,
+                },
+            },
+            {
+                "tool": "summarize_opened_page",
+                "args": {
+                    "max_results": summary_limit,
+                    "max_page_chars": 3500,
                 },
             },
         ]
 
-    # Default fallback: search flow
+    # ------------------------------------------------------------------
+    # 13. Default fallback
+    # ------------------------------------------------------------------
     return [
         {
             "tool": "search_web",
@@ -238,10 +533,20 @@ def plan_actions(
             },
         },
         {
-            "tool": "summarize_search_results",
+            "tool": "open_best_search_result",
+            "args": {},
+        },
+        {
+            "tool": "read_opened_page",
             "args": {
-                "limit": summary_limit,
-                "summary_profile": "general_search",
+                "max_chars": 5000,
+            },
+        },
+        {
+            "tool": "summarize_opened_page",
+            "args": {
+                "max_results": summary_limit,
+                "max_page_chars": 3500,
             },
         },
     ]
