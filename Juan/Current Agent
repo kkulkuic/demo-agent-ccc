@@ -1,0 +1,1447 @@
+import os
+import re
+import json
+import asyncio
+import time
+import base64
+import warnings
+from datetime import datetime
+from typing import Annotated, TypedDict, Optional, Any
+from dotenv import load_dotenv
+from playwright_stealth.stealth import Stealth
+
+warnings.filterwarnings("ignore")
+load_dotenv()
+
+# --- LANGCHAIN & GRAPH ---
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+# --- BROWSER & IMAGE ---
+from playwright.async_api import async_playwright
+from PIL import Image, ImageDraw
+
+# --- SETUP ---
+os.makedirs("logs", exist_ok=True)
+os.makedirs("playwright/.auth", exist_ok=True)
+
+MODEL_ID = "claude-haiku-4-5-20251001"
+
+def log_run(data: dict):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(base_dir, "eval_logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    path = os.path.join(log_dir, "runs.jsonl")
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+    print(f"📝 Log written to: {path}")
+
+@tool
+def stop(answer: str):
+    """
+    Call this when the task is fully complete and you have the final answer.
+    """
+    print(f"\n✅ [Agent STOP] Final answer: {answer}")
+
+    return {
+        "status": "stopped",
+        "answer": answer
+    }
+
+# ─────────────────────────────────────────────
+# 1. PERSISTENT BROWSER SESSION
+# ─────────────────────────────────────────────
+
+browser_session = {"playwright": None, "context": None, "page": None}
+
+
+async def get_session():
+    if browser_session["playwright"] is None:
+        print("🌐 Starting Stealth Playwright browser...")
+        browser_session["playwright"] = await async_playwright().start()
+        browser_session["context"] = await browser_session["playwright"].chromium.launch_persistent_context(
+            user_data_dir="playwright/.auth",
+            headless=False,
+            channel="chrome",
+            locale="en-US",
+            timezone_id="America/Chicago",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+        )
+        existing_pages = browser_session["context"].pages
+        page = existing_pages[0] if existing_pages else await browser_session["context"].new_page()
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
+        browser_session["page"] = page
+    return browser_session["page"]
+
+
+# ─────────────────────────────────────────────
+# 2. HEADED / EXECUTOR-STYLE HELPERS
+# borrowed concepts: cookie dismissal, bot detection,
+# page snapshot, clickable indexing, fallback support
+# ─────────────────────────────────────────────
+
+async def dismiss_cookie_consent(page) -> None:
+    candidates = [
+        "button:has-text('Accept')",
+        "button:has-text('I agree')",
+        "button:has-text('Allow all')",
+        "button:has-text('Accept all')",
+        "button:has-text('Got it')",
+        "button:has-text('OK')",
+        "button:has-text('Continue')",
+        "button:has-text('Agree')",
+        "button:has-text('Accept cookies')",
+        "button:has-text('Allow cookies')",
+        "text=Accept",
+        "text=I agree",
+        "text=Allow all",
+        "text=Accept all",
+        "text=Continue",
+    ]
+
+    for selector in candidates:
+        try:
+            locator = page.locator(selector).first
+            visible = await locator.is_visible(timeout=800)
+            if visible:
+                await locator.click(timeout=1500)
+                await page.wait_for_timeout(500)
+                return
+        except Exception:
+            continue
+
+
+async def safe_page_snapshot(page, max_chars: int = 3000) -> dict:
+    title = ""
+    body_sample = ""
+    url = ""
+
+    try:
+        title = (await page.title() or "").strip()
+    except Exception:
+        title = ""
+
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+
+    try:
+        body_sample = (await page.locator("body").inner_text(timeout=5000) or "")[:max_chars]
+    except Exception:
+        body_sample = ""
+
+    return {
+        "url": url,
+        "title": title,
+        "body_sample": body_sample,
+    }
+
+
+async def looks_like_bot_challenge() -> dict:
+    page = await get_session()
+
+    try:
+        body_text = (await page.locator("body").inner_text(timeout=4000) or "").lower()
+    except Exception:
+        body_text = ""
+
+    try:
+        title = (await page.title() or "").lower()
+    except Exception:
+        title = ""
+
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+
+    triggers = [
+        "unusual traffic",
+        "not a robot",
+        "captcha",
+        "verify you are human",
+        "verify you are a human",
+        "press and hold",
+        "cloudflare",
+        "checking your browser",
+        "access denied",
+    ]
+
+    haystack = f"{title}\n{url}\n{body_text}"
+    matched = [t for t in triggers if t in haystack]
+
+    return {
+        "ok": True,
+        "is_bot_challenge": len(matched) > 0,
+        "matched_triggers": matched,
+        "url": url,
+        "title": title,
+        "body_sample": body_text[:1500],
+    }
+
+
+def detect_login_wall(snapshot: dict) -> bool:
+    text = (
+        f"{snapshot.get('title', '')}\n"
+        f"{snapshot.get('url', '')}\n"
+        f"{snapshot.get('body_sample', '')}"
+    ).lower()
+
+    login_terms = [
+        "sign in",
+        "log in",
+        "login",
+        "enter your password",
+        "authentication required",
+        "continue with google",
+        "continue with email",
+    ]
+
+    blocking_terms = [
+        "to continue",
+        "to view this page",
+        "access denied",
+        "please sign in",
+        "please log in",
+        "you must be logged in",
+        "restricted access",
+        "members only",
+        "not authorized",
+    ]
+
+    has_login = any(term in text for term in login_terms)
+    has_blocking = any(term in text for term in blocking_terms)
+
+    return has_login and has_blocking
+
+
+async def install_red_dot(page) -> None:
+    await page.evaluate(
+        """
+        () => {
+            if (document.getElementById('__agent_red_dot__')) return;
+            const dot = document.createElement('div');
+            dot.id = '__agent_red_dot__';
+            dot.style.position = 'fixed';
+            dot.style.width = '14px';
+            dot.style.height = '14px';
+            dot.style.borderRadius = '50%';
+            dot.style.background = 'red';
+            dot.style.zIndex = '2147483647';
+            dot.style.pointerEvents = 'none';
+            dot.style.left = '0px';
+            dot.style.top = '0px';
+            dot.style.boxShadow = '0 0 10px rgba(255,0,0,0.8)';
+            document.body.appendChild(dot);
+        }
+        """
+    )
+
+
+async def move_red_dot(page, x: float, y: float) -> None:
+    await page.evaluate(
+        """
+        ([x, y]) => {
+            const dot = document.getElementById('__agent_red_dot__');
+            if (!dot) return;
+            dot.style.left = `${x - 7}px`;
+            dot.style.top = `${y - 7}px`;
+        }
+        """,
+        [x, y]
+    )
+
+
+async def clear_agent_highlights(page) -> None:
+    try:
+        await page.evaluate(
+            """
+            () => {
+                document.querySelectorAll('[data-agent-highlight="1"]').forEach(el => {
+                    el.style.outline = '';
+                    el.style.outlineOffset = '';
+                    el.removeAttribute('data-agent-highlight');
+                });
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
+# 3. SHARED SCREENSHOT HELPER
+# Every action tool calls this after completing.
+# Returns both the local path and base64 so the
+# agent can visually confirm what happened.
+# ─────────────────────────────────────────────
+
+async def capture(prefix: str) -> dict:
+    page = await get_session()
+    path = f"logs/{prefix}_{int(time.time())}.png"
+    await page.screenshot(path=path)
+    with open(path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    return {"screenshot_path": path, "screenshot_b64": img_b64}
+
+
+async def enrich_result(prefix: str, extra: Optional[dict] = None) -> dict:
+    page = await get_session()
+    snapshot = await safe_page_snapshot(page)
+    ss = await capture(prefix)
+    result = {}
+    if extra:
+        result.update(extra)
+    result.update(snapshot)
+    result.update(ss)
+    result.pop("screenshot_b64", None)
+
+    return result
+
+
+# ─────────────────────────────────────────────
+# 4. ORIGINAL BROWSER TOOLS
+# ─────────────────────────────────────────────
+
+@tool
+async def browser_navigate(url: str):
+    """Navigate to a URL. Returns page text + screenshot so you can confirm the page loaded."""
+    page = await get_session()
+    try:
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(1000)
+        await dismiss_cookie_consent(page)
+        content = await page.evaluate("() => document.body.innerText.substring(0, 3000)")
+        return await enrich_result("nav", {"status": "success", "content": content})
+    except Exception as e:
+        return {"error": str(e)}
+
+@tool
+async def browser_fill_search(text: str):
+    """
+    Fill a likely visible search input and press Enter.
+    """
+    page = await get_session()
+
+    selectors = [
+        "input[type='search']",
+        "input[name='search']",
+        "input[placeholder*='Search']",
+        "input[aria-label*='Search']",
+        "textarea[name='q']",
+        "input[name='q']",
+        "input[type='text']",
+    ]
+
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.is_visible(timeout=800):
+                await locator.fill("")
+                await locator.type(text, delay=10)
+                await locator.press("Enter")
+                await page.wait_for_timeout(1000)
+                return await enrich_result(
+                    "fill_search",
+                    {"status": "filled search", "selector": selector, "text": text}
+                )
+        except Exception:
+            continue
+
+    return {"error": f"Could not find a visible search input for text: {text}"}
+
+@tool
+async def browser_inspect(url: str = None):
+    """
+    Take a screenshot of the current page and return it as base64.
+    Use when click/fill is failing or you're unsure of the layout.
+    """
+    page = await get_session()
+    try:
+        if url:
+            if not url.startswith(("http://", "https://")):
+                url = f"https://{url}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(1000)
+        await dismiss_cookie_consent(page)
+        return await enrich_result("inspect", {"status": "visual captured"})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_click(selector: str):
+    """Click a UI element by CSS selector. Returns screenshot so you can confirm the click result."""
+    page = await get_session()
+    try:
+        await page.wait_for_selector(selector, timeout=10000)
+        await page.click(selector)
+        await page.wait_for_timeout(1200)
+        await dismiss_cookie_consent(page)
+        return await enrich_result("click", {"status": "clicked", "selector": selector})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_fill(selector: str, text: str):
+    """Type text into a field and press Enter. Returns screenshot so you can confirm submission."""
+    page = await get_session()
+    try:
+        await page.wait_for_selector(selector, timeout=10000)
+        await page.fill(selector, text)
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(1.5)
+        return await enrich_result(
+            "fill",
+            {"status": "filled and submitted", "selector": selector, "text": text}
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_scroll(direction: str = "down", amount: int = 500):
+    """Scroll the page up or down. Returns screenshot so you can confirm new content."""
+    page = await get_session()
+    try:
+        move = amount if direction == "down" else -amount
+        await page.evaluate(f"window.scrollBy(0, {move})")
+        await asyncio.sleep(0.5)
+        return await enrich_result("scroll", {"status": f"scrolled {direction}", "amount": amount})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_select(selector: str, value: str):
+    """Select a dropdown option. Returns screenshot so you can confirm the selection."""
+    page = await get_session()
+    try:
+        await page.wait_for_selector(selector, timeout=10000)
+        await page.select_option(selector, value=value)
+        await page.wait_for_timeout(800)
+        return await enrich_result(
+            "select",
+            {"status": f"selected '{value}'", "selector": selector, "value": value}
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_highlight(selector: str):
+    """
+    Draw a red box around an element as visual proof it was found.
+    Returns screenshot with the highlight drawn on it.
+    """
+    page = await get_session()
+    try:
+        element = await page.wait_for_selector(selector, timeout=10000)
+        box = await element.bounding_box()
+        path = f"logs/highlight_{int(time.time())}.png"
+        await page.screenshot(path=path)
+        if box:
+            with Image.open(path) as img:
+                draw = ImageDraw.Draw(img)
+                draw.rectangle(
+                    [box["x"], box["y"], box["x"] + box["width"], box["y"] + box["height"]],
+                    outline="red",
+                    width=6,
+                )
+                img.save(path)
+        with open(path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+        snapshot = await safe_page_snapshot(page)
+        return {
+            "status": "highlighted",
+            "selector": selector,
+            **snapshot,
+            "screenshot_path": path,
+            "screenshot_b64": img_b64,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_go_back():
+    """Go back to the previous page. Returns screenshot so you can confirm where you landed."""
+    page = await get_session()
+    try:
+        await page.go_back(wait_until="domcontentloaded", timeout=10000)
+        await page.wait_for_timeout(1000)
+        return await enrich_result("back", {"status": "navigated back"})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_get_text(selector: str = None):
+    """
+    Get visible text from the page or a specific element.
+    Returns screenshot alongside the text so you can confirm context.
+    """
+    page = await get_session()
+    try:
+        if selector:
+            element = await page.wait_for_selector(selector, timeout=10000)
+            text = await element.inner_text()
+        else:
+            text = await page.evaluate("() => document.body.innerText.substring(0, 3000)")
+        return await enrich_result("text", {"status": "success", "text": text, "selector": selector})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────
+# 5. BENCHMARK TOOLS (WebArena-ready)
+# ─────────────────────────────────────────────
+
+@tool
+async def get_accessibility_tree():
+    """
+    BENCHMARK TOOL. Returns the browser accessibility tree as structured text.
+    Gives stable element references (role, name, value) for reliable interaction
+    without depending on fragile CSS selectors.
+    """
+    page = await get_session()
+    try:
+        snapshot = await page.accessibility.snapshot()
+
+        def flatten(node, depth=0):
+            if node is None:
+                return []
+            lines = []
+            role = node.get("role", "")
+            name = node.get("name", "")
+            value = node.get("value", "")
+            if role not in ("none", "presentation", "generic", ""):
+                parts = [f"{'  ' * depth}[{role}]"]
+                if name:
+                    parts.append(f'"{name}"')
+                if value:
+                    parts.append(f'= "{value}"')
+                lines.append(" ".join(parts))
+            for child in node.get("children", []):
+                lines.extend(flatten(child, depth + 1))
+            return lines
+
+        tree_lines = flatten(snapshot)
+        tree_text = "\n".join(tree_lines[:300])
+        return await enrich_result("a11y", {"status": "success", "accessibility_tree": tree_text})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_click_coords(x: float, y: float):
+    """
+    BENCHMARK TOOL. Click at exact pixel coordinates (x, y).
+    """
+    page = await get_session()
+    try:
+        await install_red_dot(page)
+        await move_red_dot(page, x, y)
+        await page.wait_for_timeout(250)
+        await page.mouse.click(x, y)
+        await asyncio.sleep(0.7)
+        return await enrich_result("coords", {"status": f"clicked at ({x}, {y})", "x": x, "y": y})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_hover(selector: str):
+    """
+    BENCHMARK TOOL. Hover over an element to reveal dropdowns or tooltips.
+    """
+    page = await get_session()
+    try:
+        await page.wait_for_selector(selector, timeout=10000)
+        await page.hover(selector)
+        await asyncio.sleep(0.5)
+        return await enrich_result("hover", {"status": "hovered", "selector": selector})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_key_press(key: str):
+    """
+    BENCHMARK TOOL. Press a keyboard key or chord.
+    """
+    page = await get_session()
+    try:
+        await page.keyboard.press(key)
+        await asyncio.sleep(0.5)
+        return await enrich_result("key", {"status": f"pressed '{key}'", "key": key})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def browser_wait(seconds: float = 2.0):
+    """
+    BENCHMARK TOOL. Wait for slow JS rendering or network requests to settle.
+    """
+    await asyncio.sleep(seconds)
+    return await enrich_result("wait", {"status": f"waited {seconds}s", "seconds": seconds})
+
+
+@tool
+async def list_clickable_elements(max_items: int = 40, min_text_len: int = 1):
+    """
+    BENCHMARK TOOL. List likely clickable visible elements and tag them with indices.
+    Useful fallback when CSS selectors are unreliable.
+    """
+    page = await get_session()
+
+    try:
+        await dismiss_cookie_consent(page)
+        await page.wait_for_timeout(300)
+
+        items = await page.evaluate(
+            """
+            ([maxItems, minTextLen]) => {
+                const selectors = [
+                    'a[href]',
+                    'button',
+                    'input[type="button"]',
+                    'input[type="submit"]',
+                    'input[type="reset"]',
+                    '[role="button"]',
+                    '[role="link"]',
+                    '[role="menuitem"]',
+                    '[role="tab"]',
+                    '[onclick]',
+                    'summary',
+                    'label'
+                ];
+
+                const seen = new Set();
+                const elements = [];
+
+                function isVisible(el) {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none'
+                    );
+                }
+
+                function cleanText(text) {
+                    return (text || '').replace(/\\s+/g, ' ').trim();
+                }
+
+                function cssPath(el) {
+                    if (!(el instanceof Element)) return '';
+                    const path = [];
+                    let current = el;
+
+                    while (current && current.nodeType === Node.ELEMENT_NODE && path.length < 5) {
+                        let selector = current.nodeName.toLowerCase();
+
+                        if (current.id) {
+                            selector += '#' + current.id;
+                            path.unshift(selector);
+                            break;
+                        }
+
+                        const classList = [...current.classList].slice(0, 2).join('.');
+                        if (classList) {
+                            selector += '.' + classList;
+                        }
+
+                        const parent = current.parentElement;
+                        if (parent) {
+                            const siblings = [...parent.children].filter(
+                                child => child.nodeName === current.nodeName
+                            );
+                            if (siblings.length > 1) {
+                                const index = siblings.indexOf(current) + 1;
+                                selector += `:nth-of-type(${index})`;
+                            }
+                        }
+
+                        path.unshift(selector);
+                        current = current.parentElement;
+                    }
+
+                    return path.join(' > ');
+                }
+
+                const candidates = document.querySelectorAll(selectors.join(','));
+
+                for (const el of candidates) {
+                    if (elements.length >= maxItems) break;
+                    if (!isVisible(el)) continue;
+
+                    const rect = el.getBoundingClientRect();
+                    const text = cleanText(
+                        el.innerText ||
+                        el.textContent ||
+                        el.getAttribute('aria-label') ||
+                        el.getAttribute('title') ||
+                        el.getAttribute('value') ||
+                        ''
+                    );
+
+                    const role = el.getAttribute('role') || '';
+                    const tag = el.tagName.toLowerCase();
+                    const href = el.getAttribute('href') || '';
+                    const selector = cssPath(el);
+
+                    const dedupeKey = `${tag}|${text}|${selector}|${Math.round(rect.x)}|${Math.round(rect.y)}`;
+                    if (seen.has(dedupeKey)) continue;
+                    seen.add(dedupeKey);
+
+                    if (text.length < minTextLen && !href && !role) continue;
+
+                    el.setAttribute('data-agent-index', String(elements.length + 1));
+
+                    elements.push({
+                        index: elements.length + 1,
+                        text: text.slice(0, 120),
+                        tag,
+                        role,
+                        href,
+                        selector,
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                    });
+                }
+
+                return elements;
+            }
+            """,
+            [max_items, min_text_len]
+        )
+
+        return await enrich_result(
+            "clickables",
+            {"status": "success", "count": len(items), "elements": items}
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def highlight_element_index(index: int):
+    """
+    BENCHMARK TOOL. Highlight a previously indexed clickable element.
+    Run list_clickable_elements first.
+    """
+    page = await get_session()
+    try:
+        await clear_agent_highlights(page)
+
+        locator = page.locator(f'[data-agent-index="{index}"]').first
+        if not await locator.is_visible(timeout=1500):
+            return {"error": f"Could not find visible element with index {index}. Run list_clickable_elements first."}
+
+        await install_red_dot(page)
+        box = await locator.bounding_box()
+        if box:
+            await move_red_dot(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+        await locator.evaluate(
+            """
+            el => {
+                el.setAttribute('data-agent-highlight', '1');
+                el.style.outline = '4px solid red';
+                el.style.outlineOffset = '3px';
+            }
+            """
+        )
+
+        await page.wait_for_timeout(500)
+
+        text = ""
+        try:
+            text = (await locator.inner_text(timeout=1000) or "").strip()
+        except Exception:
+            text = ""
+
+        return await enrich_result(
+            "highlight_index",
+            {"status": "highlighted", "index": index, "text": text[:120]}
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+async def click_element_by_index(index: int):
+    """
+    BENCHMARK TOOL. Click a previously indexed clickable element.
+    Run list_clickable_elements first.
+    """
+    page = await get_session()
+    try:
+        locator = page.locator(f'[data-agent-index="{index}"]').first
+        if not await locator.is_visible(timeout=1500):
+            return {"error": f"Could not find visible element with index {index}. Run list_clickable_elements first."}
+
+        await install_red_dot(page)
+        box = await locator.bounding_box()
+        if box:
+            await move_red_dot(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            await page.wait_for_timeout(350)
+
+        text = ""
+        try:
+            text = (await locator.inner_text(timeout=1000) or "").strip()
+        except Exception:
+            text = ""
+
+        await locator.click(timeout=5000)
+        await page.wait_for_timeout(1200)
+        await dismiss_cookie_consent(page)
+
+        return await enrich_result(
+            "click_index",
+            {"status": "clicked indexed element", "index": index, "text": text[:120]}
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────
+# 6. TOOL REGISTRY
+# ─────────────────────────────────────────────
+
+tools = [
+    browser_navigate,
+    browser_inspect,
+    browser_click,
+    browser_fill,
+    browser_fill_search,
+    browser_scroll,
+    browser_select,
+    browser_highlight,
+    browser_go_back,
+    browser_get_text,
+    get_accessibility_tree,
+    browser_click_coords,
+    browser_hover,
+    browser_key_press,
+    browser_wait,
+    list_clickable_elements,
+    highlight_element_index,
+    click_element_by_index,
+    stop,
+]
+
+base_tool_node = ToolNode(tools)
+
+# ─────────────────────────────────────────────
+# 7. STATE & AGENT
+# ─────────────────────────────────────────────
+
+class State(TypedDict, total=False):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+    # task tracking
+    task_goal: Optional[str]
+    current_step: Optional[str]
+
+    # execution tracking
+    attempt_count: int
+    last_tool: Optional[str]
+    last_tool_result: Optional[dict]
+    blocked_reason: Optional[str]
+    done: bool
+
+    # page + context
+    context: dict[str, Any]
+    page_stall_count: int
+    last_url: Optional[str]
+    last_title: Optional[str]
+
+    # history
+    action_history: list[dict[str, Any]]
+
+    # metrics
+    total_steps: int
+    fallback_count: int
+    success_count: int
+    failure_count: int
+
+SYSTEM_PROMPT = """You are a Browser Navigation Agent. You control a real Chrome browser to complete tasks on live websites.
+
+━━ PRIMARY GOAL ━━
+Focus on task completion and flow reliability.
+Use tools in a grounded, step-by-step way.
+Do not guess. Only claim what you can verify from tool outputs.
+
+━━ VISION ━━
+Most tools return screenshot_b64 and page text/state.
+After every action, verify:
+- the page changed as expected
+- no modal, error, CAPTCHA, or login wall appeared
+- the target is still correct
+
+━━ AVAILABLE STRATEGIES ━━
+Basic browser actions:
+- browser_navigate
+- browser_click
+- browser_fill
+- browser_fill_search     → use this when a search box is visible but click/fill keeps failing
+- browser_scroll
+- browser_select
+- browser_hover
+- browser_key_press
+- browser_go_back
+- browser_get_text
+- browser_wait
+- browser_inspect
+
+Fallback / recovery tools:
+- get_accessibility_tree
+- list_clickable_elements
+- highlight_element_index
+- click_element_by_index
+- browser_click_coords
+- browser_highlight
+
+
+
+━━ TOOL PRIORITY ━━
+1. Navigate or inspect current page.
+2. Try direct selector-based action first.
+3. If selector is unreliable, use:
+   - get_accessibility_tree
+   - list_clickable_elements
+   - highlight_element_index
+   - click_element_by_index
+4. If page is slow, use browser_wait.
+5. If clearly done, call stop(answer).
+6. If a search box is visible but direct click or selector-based fill fails, use browser_fill_search.
+
+━━ FAILURE POLICY ━━
+If the same action approach keeps failing:
+- switch strategy instead of repeating blindly
+- after repeated failures or block conditions, ask the human
+If you repeat the same discovery tools (accessibility tree, clickable elements, inspect) without progress, switch strategies instead of repeating.
+
+━━ WHEN TO ASK THE HUMAN ━━
+- CAPTCHA or bot challenge
+- login wall requiring credentials
+- ambiguous target choice
+- repeated action failure after fallback attempts
+- a required decision is subjective and not visible
+
+When asking, be short and structured:
+- what you tried
+- what blocked you
+- what you need from the human
+
+━━ COMPLETION RULE ━━
+When you have the final answer, you MUST call stop(answer) instead of replying normally.
+Do not end with a normal assistant message when the task is complete."""
+
+llm = ChatAnthropic(
+    model=MODEL_ID,
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    temperature=0
+).bind_tools(tools)
+
+
+def parse_tool_content(raw_content: Any) -> dict:
+    if isinstance(raw_content, dict):
+        content = dict(raw_content)
+    elif isinstance(raw_content, list):
+        content = raw_content[0] if raw_content and isinstance(raw_content[0], dict) else {"raw": raw_content}
+    else:
+        return {"raw": str(raw_content)}
+
+    # 🚨 REMOVE HEAVY FIELDS
+    content.pop("screenshot_b64", None)
+
+    # truncate large text fields
+    if "body_sample" in content:
+        content["body_sample"] = content["body_sample"][:1000]
+
+    if "content" in content:
+        content["content"] = content["content"][:1000]
+
+    if "accessibility_tree" in content:
+        content["accessibility_tree"] = content["accessibility_tree"][:1500]
+
+    return content
+
+
+def classify_result_status(result: dict) -> str:
+    if not isinstance(result, dict):
+        return "unknown"
+
+    if result.get("error"):
+        return "failed"
+
+    status = str(result.get("status", "")).lower()
+    if "stopped" in status:
+        return "done"
+    if "success" in status or "clicked" in status or "filled" in status or "selected" in status:
+        return "success"
+    if "waited" in status or "visual captured" in status or "hovered" in status or "highlighted" in status:
+        return "partial"
+
+    return "partial"
+
+
+async def evaluate_page_blockers() -> tuple[Optional[str], dict]:
+    page = await get_session()
+    snapshot = await safe_page_snapshot(page, max_chars=2000)
+    bot = await looks_like_bot_challenge()
+
+    if bot.get("is_bot_challenge"):
+        return f"Bot challenge detected: {', '.join(bot.get('matched_triggers', []))}", snapshot
+
+    if detect_login_wall(snapshot):
+        return "Login wall detected", snapshot
+
+    return None, snapshot
+
+def choose_forced_fallback(state: State) -> Optional[dict]:
+    """
+    Force a smarter next tool when the agent is looping or an action failed.
+    Returns a tool call dict like:
+    {"name": "list_clickable_elements", "args": {"max_items": 40}}
+    """
+    last_tool = state.get("last_tool")
+    last_result = state.get("last_tool_result") or {}
+    attempt_count = state.get("attempt_count", 0)
+    action_history = state.get("action_history", [])
+
+    recent_tools = [h.get("tool") for h in action_history[-6:]]
+
+    # Search-box loop breaker
+    search_loop_count = sum(
+        t in {"browser_click", "list_clickable_elements", "get_accessibility_tree", "browser_inspect"}
+        for t in recent_tools
+    )
+    if search_loop_count >= 5:
+        return {
+            "name": "browser_fill_search",
+            "args": {"text": "Chicago"}  # will be overridden only if user task is different later
+        }
+
+    # Direct click failed repeatedly -> switch to clickable list
+    if last_tool == "browser_click" and attempt_count >= 1:
+        return {
+            "name": "list_clickable_elements",
+            "args": {"max_items": 40}
+        }
+
+    # If clickable list already happened, try indexed click if possible
+    if last_tool == "list_clickable_elements":
+        elements = last_result.get("elements", [])
+        if elements:
+            return {
+                "name": "click_element_by_index",
+                "args": {"index": 1}
+            }
+
+    # If indexed click failed, inspect
+    if last_tool == "click_element_by_index" and attempt_count >= 1:
+        return {
+            "name": "browser_inspect",
+            "args": {}
+        }
+
+    return None
+
+def build_forced_tool_ai_message(tool_name: str, args: dict) -> AIMessage:
+    return AIMessage(
+        content="",
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": f"toolu_{int(time.time()*1000)}",
+                    "type": "tool_use",
+                    "name": tool_name,
+                    "input": args,
+                }
+            ]
+        },
+    )
+
+
+async def tools_node(state: State):
+    result = await base_tool_node.ainvoke(state)
+
+    tool_msgs = result.get("messages", [])
+    if not tool_msgs:
+        return result
+
+    last_msg = tool_msgs[-1]
+    tool_name = getattr(last_msg, "name", "unknown")
+    parsed = parse_tool_content(getattr(last_msg, "content", {}))
+    result_status = classify_result_status(parsed)
+
+    blocked_reason, snapshot = await evaluate_page_blockers()
+
+    # ✅ Only block if action failed OR page is clearly unusable
+    if blocked_reason and result_status == "success":
+        blocked_reason = None
+
+    previous_tool = state.get("last_tool")
+    previous_url = state.get("last_url")
+    attempt_count = state.get("attempt_count", 0)
+    page_stall_count = state.get("page_stall_count", 0)
+    done = state.get("done", False)
+
+    if previous_tool == tool_name and result_status == "failed":
+        attempt_count += 1
+    elif result_status == "failed":
+        attempt_count = 1
+    else:
+        attempt_count = 0
+
+    current_url = snapshot.get("url")
+    current_title = snapshot.get("title")
+
+    # ✅ Only count stalls for REAL ACTIONS (not inspection tools)
+    ACTION_TOOLS = {
+        "browser_click",
+        "browser_fill",
+        "browser_select",
+        "browser_click_coords",
+        "click_element_by_index",
+        "browser_key_press",
+        "browser_go_back",
+    }
+
+    if (
+        tool_name in ACTION_TOOLS
+        and current_url
+        and previous_url
+        and current_url == previous_url
+        and result_status in {"partial", "failed"}
+    ):
+        page_stall_count += 1
+    else:
+        page_stall_count = 0
+
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    if result_status == "done" or parsed.get("status") == "stopped":
+        done = True
+    if done:
+        run_data = {
+            "timestamp": datetime.now().isoformat(),
+            "question": state.get("task_goal"),
+            "answer": parsed.get("answer"),
+            "steps": state.get("total_steps", 0),
+            "fallbacks": state.get("fallback_count", 0),
+            "success_steps": state.get("success_count", 0),
+            "failed_steps": state.get("failure_count", 0),
+            "actions": state.get("action_history", []),
+        }
+
+        print("📝 done=True, writing log now...")
+        log_run(run_data)
+
+    
+
+    context = dict(state.get("context", {}))
+    context["last_status"] = result_status
+    context["last_snapshot"] = snapshot
+    context["last_tool_name"] = tool_name
+
+    history = list(state.get("action_history", []))
+    history.append(
+        {
+            "tool": tool_name,
+            "status": result_status,
+            "url": current_url,
+            "title": current_title,
+            "error": parsed.get("error"),
+        }
+    )
+    history = history[-12:]
+
+    if attempt_count >= 2 and not blocked_reason and parsed.get("error"):
+        blocked_reason = f"Repeated failure using {tool_name}: {parsed.get('error')}"
+
+    total_steps = state.get("total_steps", 0) + 1
+    fallback_count = state.get("fallback_count", 0)
+    success_count = state.get("success_count", 0)
+    failure_count = state.get("failure_count", 0)
+
+    if tool_name in {
+        "get_accessibility_tree",
+        "list_clickable_elements",
+        "highlight_element_index",
+        "click_element_by_index",
+        "browser_click_coords",
+        "browser_inspect",
+        "browser_fill_search",
+    }:
+        fallback_count += 1
+
+    if result_status in {"success", "done"}:
+        success_count += 1
+    elif result_status == "failed":
+        failure_count += 1
+
+    if page_stall_count >= 3 and not blocked_reason:
+        blocked_reason = "Page state appears stalled after repeated actions"
+
+    return {
+        **result,
+        "last_tool": tool_name,
+        "last_tool_result": parsed,
+        "attempt_count": attempt_count,
+        "blocked_reason": blocked_reason,
+        "done": done,
+        "context": context,
+        "last_url": current_url,
+        "last_title": current_title,
+        "page_stall_count": page_stall_count,
+        "action_history": history,
+        "total_steps": total_steps,
+        "fallback_count": fallback_count,
+        "success_count": success_count,
+        "failure_count": failure_count,
+    }
+
+
+async def agent_node(state: State):
+    # Forced fallback first
+    forced = choose_forced_fallback(state)
+    if forced:
+        print(f"\n🟡 [Forced Fallback]: {forced['name']} {forced['args']}")
+        return {
+            "messages": [build_forced_tool_ai_message(forced["name"], forced["args"])]
+        }
+
+    execution_note = {
+        "task_goal": state.get("task_goal"),
+        "current_step": state.get("current_step"),
+        "last_tool": state.get("last_tool"),
+        "attempt_count": state.get("attempt_count", 0),
+        "blocked_reason": state.get("blocked_reason"),
+        "last_url": state.get("last_url"),
+        "last_title": state.get("last_title"),
+        "last_tool_result": state.get("last_tool_result"),
+        "page_stall_count": state.get("page_stall_count", 0),
+    }
+
+    MAX_HISTORY = 4
+    trimmed_history = state["messages"][-MAX_HISTORY:]
+
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(
+            content=f"Execution state:\n{json.dumps(execution_note, ensure_ascii=False, default=str)}"
+        ),
+    ] + trimmed_history
+
+    response = await llm.ainvoke(messages)
+
+    # Auto-stop guard
+    has_tool_calls = bool(getattr(response, "tool_calls", None))
+
+    text_content = ""
+    if isinstance(response.content, str):
+        text_content = response.content.strip()
+    elif isinstance(response.content, list):
+        parts = []
+        for block in response.content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        text_content = "\n".join(parts).strip()
+
+    if not has_tool_calls and text_content:
+        print("⚡ Auto-converting final text response into stop()")
+
+        return {
+            "messages": [
+                build_forced_tool_ai_message(
+                    "stop",
+                    {"answer": text_content}
+                )
+            ]
+        }
+
+    if isinstance(response.content, str) and response.content.strip():
+        print(f"\n🟢 [Agent]:\n{response.content}")
+    elif isinstance(response.content, list):
+        for block in response.content:
+            if isinstance(block, dict) and block.get("type") == "text" and block["text"].strip():
+                print(f"\n🟢 [Agent]:\n{block['text']}")
+
+    return {"messages": [response]}
+
+def human_input_node(state: State):
+    reason = state.get("blocked_reason")
+    prompt = "Waiting for your input:"
+    if reason:
+        prompt = f"Agent needs help. Reason: {reason}\nPlease respond:"
+
+    user_input = interrupt(prompt)
+
+    return {
+        "messages": [HumanMessage(content=user_input)],
+        "attempt_count": 0,
+        "blocked_reason": None,
+        "page_stall_count": 0,
+        "current_step": "resumed after human input",
+    }
+
+def router(state: State):
+    """
+    Decide what happens after the agent speaks.
+    """
+
+    # If task is done → END
+    if state.get("done"):
+        return "end"
+
+    # If blocked → ask human
+    if state.get("blocked_reason"):
+        return "human_input"
+
+    # If agent produced a tool call → go to tools
+    last_msg = state.get("messages", [])[-1]
+    if isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None):
+        return "tools"
+
+    # Default → keep reasoning
+    return "agent"
+
+
+# ─────────────────────────────────────────────
+# 8. BUILD GRAPH
+# ─────────────────────────────────────────────
+
+workflow = StateGraph(State)
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tools_node)
+workflow.add_node("human_input", human_input_node)
+
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges(
+    "agent",
+    router,
+    {
+        "tools": "tools",
+        "human_input": "human_input",
+        "end": "__end__",
+    },
+)
+workflow.add_edge("tools", "agent")
+workflow.add_edge("human_input", "agent")
+
+app = workflow.compile(checkpointer=InMemorySaver())
+
+# ─────────────────────────────────────────────
+# 9. MAIN LOOP (HITL)
+# ─────────────────────────────────────────────
+
+async def stream_run(input_data, config):
+    async for event in app.astream(input_data, config, stream_mode="updates"):
+        for node, data in event.items():
+            if node == "tools":
+                msgs = data.get("messages", [])
+                if msgs:
+                    tool_name = getattr(msgs[-1], "name", "tool")
+                    print(f"  🔧 [{tool_name}] executed")
+                    blocked_reason = data.get("blocked_reason")
+                    if blocked_reason:
+                        print(f"  ⚠️ Blocked: {blocked_reason}")
+            elif node == "agent":
+                if data.get("done"):
+                    print("  ✅ Agent marked task complete.")
+
+
+async def main():
+    config = {"configurable": {"thread_id": "nav-session"}}
+
+    print("\n" + "═" * 58)
+    print("  🌐  BROWSER NAVIGATION AGENT  (Improved Arena Flow)")
+    print("═" * 58)
+    print("  Added state tracking, retry handling, blockers, and HITL.")
+    print("  Type 'exit' at any time to quit.")
+    print("─" * 58)
+
+    initial_prompt = input("\n[Task]: ").strip()
+    if not initial_prompt or initial_prompt.lower() == "exit":
+        print("Exiting.")
+        return
+
+    initial_state: State = {
+        "messages": [HumanMessage(content=initial_prompt)],
+        "task_goal": initial_prompt,
+        "current_step": "start",
+        "attempt_count": 0,
+        "last_tool": None,
+        "last_tool_result": None,
+        "blocked_reason": None,
+        "done": False,
+        "context": {},
+        "page_stall_count": 0,
+        "last_url": None,
+        "last_title": None,
+        "action_history": [],
+        "total_steps": 0,
+        "fallback_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+    }
+
+    print("\n⏳ Starting...\n")
+    await stream_run(initial_state, config)
+
+    while True:
+        user_cmd = input("\n[Your reply / 'exit']: ").strip()
+
+        if user_cmd.lower() == "exit":
+            print("\nShutting down...")
+            break
+
+        if not user_cmd:
+            user_cmd = "Please continue."
+
+        print("\n⏳ Resuming...\n")
+        try:
+            await stream_run(Command(resume=user_cmd), config)
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            break
+
+    if browser_session["context"]:
+        print("🧹 Closing browser...")
+        await browser_session["context"].close()
+    if browser_session["playwright"]:
+        await browser_session["playwright"].stop()
+
+    print("\n✅ Session ended.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⚠️ Interrupted.")
