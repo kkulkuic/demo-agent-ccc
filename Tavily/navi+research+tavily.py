@@ -366,11 +366,17 @@ async def _dismiss_popups(page) -> list[str]:
             "close", "dismiss", "no thanks", "reject all",
             "×", "✕", "✖", "x",
         ]
+        # Skip Chrome restore/crash banners — never click Restore
+        chrome_skip = ["restore", "send crash", "help make google chrome"]
+
         buttons = await page.query_selector_all("button, [role=button], a[href='#']")
         for btn in buttons[:40]:
             try:
                 text = (await btn.inner_text()).strip().lower()
                 aria = (await btn.get_attribute("aria-label") or "").lower()
+                # Skip Chrome crash/restore dialog buttons
+                if any(s in text for s in chrome_skip):
+                    continue
                 if any(t in text or t in aria for t in dismiss_texts):
                     box = await btn.bounding_box()
                     if box and box["width"] > 0:
@@ -768,10 +774,18 @@ async def stop(answer: str):
         page = await get_session()
         await page.bring_to_front()
         await page.evaluate("""() => {
+            // Scroll back to top first, then find first meaningful content
+            window.scrollTo(0, 0);
             const targets = [
-                'table', 'h2', 'h3',
+                'table',
                 '[class*="pricing"]', '[class*="price"]',
                 '[class*="rate"]',    '[class*="tier"]',
+                '[class*="cost"]',    '[class*="plan"]',
+                // GCP / cloud doc specific
+                'devsite-table', 'devsite-section',
+                '[class*="devsite"]',
+                '[data-custom-type="pricing"]',
+                'h2', 'h3', 'h1',
             ];
             for (const sel of targets) {
                 const el = document.querySelector(sel);
@@ -823,7 +837,7 @@ def _tv() -> TavilyClient:
 
 
 @tool
-async def web_search(query: str, num_results: int = 5) -> str:
+async def web_search(query: str, num_results: int = 7) -> str:
     """Search the web for any topic — news, facts, product info, stats."""
     try:
         result = await asyncio.to_thread(
@@ -926,28 +940,44 @@ Every tool automatically returns a dom_snapshot:
     → browser_inspect()                    screenshot after subsequent actions only
 
     Google Maps directions:
-    1. get_accessibility_tree → click Directions button
-    2. browser_type() origin → browser_click_coords for first suggestion
-    3. browser_type() destination → browser_click_coords for first suggestion
-    4. browser_inspect() to see routes
-    5. browser_scroll_element('div[role=main]') to reveal alternate routes
-    6. Do NOT click gray map canvas lines — unreliable
+    1. browser_navigate("https://www.google.com/maps", visual=True)
+    2. dismiss_popups() once to clear Chrome restore banners before doing anything
+    3. browser_click('button[aria-label="Directions"]') to open directions panel
+    4. browser_click origin input → browser_type() the starting location
+    5. browser_wait(1) to let suggestions load
+       → call get_accessibility_tree() to read the suggestion list
+       → find the best matching suggestion by name in the tree
+       → call browser_inspect() to get a screenshot
+       → use browser_click_coords() on the suggestion position from the screenshot
+       → NEVER click (200,100) or any hardcoded coordinate before doing these steps
+    6. browser_click destination input → browser_type() the destination
+    7. Repeat step 5 for destination — same process, no guessing
+    8. browser_wait(2) then browser_inspect() to confirm route is drawn on map
+    9. The route panel MUST be visible before calling stop() — if map is zoomed out
+       with no route shown, the directions panel has collapsed:
+       → browser_click('div[id="omnibox-directions"]') to reopen it
+       → or browser_navigate to direct URL format:
+         https://www.google.com/maps/dir/ORIGIN/DESTINATION
+       → then browser_inspect() to confirm route is visible before stop()
 
     Google Maps transport modes — ALWAYS check all 4 by default:
     The mode buttons (Drive/Transit/Walk/Cycle) appear at the top of the directions panel.
-    Use URL parameter to switch modes reliably — do NOT try clicking small icons:
-      Driving : replace data= segment with !3e0
-      Transit : replace data= segment with !3e1
-      Walking : replace data= segment with !3e2
-      Cycling : replace data= segment with !3e3
+    NEVER modify the URL to switch modes — always click the buttons in the panel.
     Strategy:
-    1. Get driving route first (default)
-    2. Modify URL !3e0 → !3e1 for transit, browser_navigate to new URL
-    3. Modify URL !3e0 → !3e2 for walking, browser_navigate to new URL
-    4. Modify URL !3e0 → !3e3 for cycling, browser_navigate to new URL
-    5. Compile all 4 results into a single summary
-    ALWAYS check all transport modes for any route query — never assume the user
-    only wants driving even if they did not explicitly ask for all modes.
+    1. After route loads, browser_inspect() to see all 4 mode buttons at top of panel
+    2. get_accessibility_tree() to find exact button positions and labels
+    3. Click each mode button one at a time using browser_click_coords():
+         - Car/Drive icon  → first button  (coords approx x=155, y=57)
+         - Transit icon    → second button (coords approx x=203, y=57)
+         - Walk icon       → third button  (coords approx x=251, y=57)
+         - Cycle icon      → fourth button (coords approx x=299, y=57)
+    4. After each click: browser_wait(1) then browser_inspect() to read the result
+    5. Note each mode time/distance, then move to next mode button
+    6. Compile all 4 results into a single summary
+    If a mode button click does not change the view — browser_inspect() first to
+    confirm button positions from screenshot, then retry with corrected coordinates.
+    NEVER navigate to a new URL to switch transport modes.
+    ALWAYS check all transport modes for any route query.
 
   is_spa=true
     → browser_navigate(url, visual=True)   always visual on SPA first load
@@ -1012,9 +1042,20 @@ Every tool automatically returns a dom_snapshot:
 ━━ ALWAYS END WITH stop() ━━
   NEVER write the answer as plain text — always call stop() as a tool.
   Before calling stop():
-    1. Scroll to the relevant content so it's visible on screen
-    2. browser_inspect() to visually confirm the right content is showing
-    3. call stop(answer=...)
+    1. Scroll back to the TOP of the page first (browser_key_press("Control+Home"))
+    2. Then scroll DOWN to the first pricing table or main content section
+    3. browser_inspect() to visually confirm pricing/content is visible on screen
+    4. ONLY call stop(answer=...) when pricing tables or main content are in the screenshot
+    5. NEVER call stop() when the screenshot shows a footer, nav menu, or blank area
+
+━━ DROPDOWN / AUTOCOMPLETE RULE ━━
+  Whenever a dropdown or autocomplete suggestion list appears after typing:
+    1. browser_wait(1) — let suggestions fully load
+    2. get_accessibility_tree() — read suggestion labels and positions
+    3. browser_inspect() — take a screenshot to visually confirm positions
+    4. browser_click_coords() — click using coordinates from the screenshot
+  NEVER click a dropdown suggestion with a guessed coordinate before doing steps 1-3.
+  If the suggestion is not found in the tree — browser_inspect() first, then click.
 
 ━━ FALLBACK CHAIN ━━
   1. dom_snapshot buttons/inputs → browser_click(id or [aria-label='...'])
@@ -1042,6 +1083,10 @@ Every tool automatically returns a dom_snapshot:
   Before stating ANY result (route time, price, form state, button label):
     → call browser_inspect() first to confirm it is actually on screen.
   "appears to be", "I can see", "it shows" are only valid after a fresh screenshot.
+  For Google Maps specifically:
+    -> NEVER call stop() if the final screenshot shows a zoomed-out map with no
+       route line drawn — that means the directions panel has closed.
+    -> Always confirm the blue route line AND travel time are visible before stop().
 
 ━━ PERSONAL INFO RULE ━━
   NEVER invent or assume personal details — DOB, name, address, phone, email, SSN.
@@ -1066,16 +1111,33 @@ TOOLS:
   web_fetch(url)      → fetch a URL directly via HTTP — use when deep_scrape fails or returns empty
 
 STRICT WORKFLOW — follow this order every time:
-  Step 1: web_search (1-2 calls max) to find the most relevant URLs on the topic
-  Step 2: deep_scrape the 2-4 most relevant URLs from Step 1 for detailed content
-           → if deep_scrape returns empty or very little text, retry that URL with web_fetch
+  Step 1: ALWAYS do 2-3 web_searches with DIFFERENT angles/keywords — never repeat the same query.
+           This applies to ALL queries, simple or complex. More searches = more URLs = better answer.
+      -> Examples for "hiking near Chicago":
+           Search 1: "best hiking trails near Chicago Illinois"
+           Search 2: "Forest Preserves Cook County hiking trails"
+           Search 3: "state parks day hikes near Chicago 2025"
+      -> Examples for "best auto insurance Chicago 2025":
+           Search 1: "best auto insurance rates Chicago Illinois 2025"
+           Search 2: "auto insurance discounts Illinois 2025"
+           Search 3: "cheapest auto insurance 2022 Honda Civic Chicago"
+      -> Examples for a simple query like "Starved Rock address":
+           Search 1: "Starved Rock State Park address"
+           Search 2: "Starved Rock State Park location hours"
+           Search 3: "Starved Rock State Park visitor info 2025"
+
+  Step 2: deep_scrape OR web_fetch the top URLs collected across ALL searches
+           -> scrape at least 4-6 URLs total for broad queries, 2-3 for simple queries
+           -> try deep_scrape first on each URL
+           -> if deep_scrape returns empty or very little text, retry with web_fetch
+           -> do NOT stop scraping early — more sources = better answer
   Step 3: compile everything into a final summary — STOP, do not search or scrape again
 
 RULES:
-1. NEVER call web_search after you have started deep_scraping — no going back.
-2. NEVER call web_search more than twice — the second call is only if the first returned poor results.
-3. deep_scrape 2-4 URLs to get sufficient detail before summarizing.
-4. Use web_fetch only as a fallback when deep_scrape fails — not as a first choice.
+1. NEVER call web_search after you have started scraping — plan all searches first, then scrape.
+2. Every web_search call MUST use different keywords — never repeat a query.
+3. ALWAYS scrape at least 4-6 URLs for broad queries before summarizing.
+4. Use web_fetch only as a fallback when deep_scrape fails on the same URL.
 5. Write a clean, well-formatted summary: bullet points, bold key facts, prices, discounts.
 6. Do NOT open a browser or navigate anywhere — text tools only.
 7. After summarising, return control to the human. Do not ask follow-up questions.
@@ -1343,11 +1405,11 @@ async def research_agent_node(state: State) -> dict:
         for word in q.split():
             if len(word) > 4:
                 word_counts[word] += 1
-    is_looping = any(count >= 4 for count in word_counts.values()) and steps >= 10
-    hard_limit = steps >= 20  # absolute ceiling regardless of query diversity
+    is_looping = any(count >= 3 for count in word_counts.values()) and steps >= 6
+    hard_limit = steps >= 12  # absolute ceiling for research tasks
 
     if hard_limit or is_looping:
-        reason = "hard limit (15 calls)" if hard_limit else f"redundant searches detected after {steps} calls"
+        reason = "hard limit (12 calls)" if hard_limit else f"redundant searches detected after {steps} calls"
         print(f"\n[Research Budget] {reason} -- forcing final summary.")
         prompt = RESEARCH_SYSTEM_PROMPT + (
             f"\n\n*** HARD STOP: {reason}. "
@@ -1357,7 +1419,7 @@ async def research_agent_node(state: State) -> dict:
         # _base has no tools bound -- model physically cannot call more tools
         response = await _base.ainvoke([SystemMessage(content=prompt)] + _safe_messages(raw))
 
-    elif steps >= 15:
+    elif steps >= 8:
         print(f"\n[Research Budget] {steps} calls -- nudging toward summary.")
         prompt = RESEARCH_SYSTEM_PROMPT + (
             f"\n\n*** NOTE: {steps} tool calls made. "
@@ -1476,7 +1538,7 @@ async def main():
     config = {"configurable": {"thread_id": f"nav-{sid}"}}
 
     print("\n  🤖  BROWSER + RESEARCH AGENT  v8")
-    print("  🔍  r → research  (web search, scrape, compare prices)")
+    print("  🔍  r → research  (web search, deep scrape, web fetch)")
     print("  🌐  n → navigate  (live browser, click, fill)\n")
 
     await stream_run({"messages": [], "mode": "unknown"}, config)
