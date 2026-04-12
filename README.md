@@ -8,6 +8,7 @@ Hybrid research + navigation agent with Streamlit UI.
 |--------|-------------|
 | `main` | Baseline scraper experiments |
 | `research+navi` | **This branch** — Tavily-powered research + Playwright navigation agent |
+| `Firecrawl/` | Deprecated — Firecrawl version (API incompatible) |
 
 ## Quick Start (research+navi branch)
 
@@ -31,27 +32,6 @@ cp .env.example .env
 streamlit run app.py --server.port 8530
 ```
 
-## UI Options
-
-| File | Framework | Port | Description |
-|------|-----------|------|-------------|
-| `app.py` | Streamlit | 8530 | Full-featured with tabs, pipeline, HITL |
-| `chainlit_app.py` | Chainlit | 8000 | Lightweight chat UI, native tool steps |
-
-```bash
-# Streamlit
-streamlit run app.py --server.port 8530
-
-# Chainlit
-chainlit run chainlit_app.py --port 8000
-```
-
-## Testing
-
-```bash
-python test_chainlit.py
-```
-
 ## Features
 
 - **Semantic intent classification** — LLM decides navigate vs research
@@ -63,9 +43,7 @@ python test_chainlit.py
 
 ```
 ├── app.py              # Streamlit UI (entry point)
-├── chainlit_app.py     # Chainlit UI (lightweight alternative)
 ├── research+navi.py    # LangGraph agent + tools
-├── test_chainlit.py    # Test suite
 ├── .env.example        # API key template
 ├── requirements.txt    # Python deps
 └── README.md

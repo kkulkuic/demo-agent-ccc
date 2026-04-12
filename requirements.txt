@@ -8,4 +8,3 @@ playwright>=1.50
 playwright-stealth
 Pillow>=10
 python-dotenv
-chainlit>=2.0

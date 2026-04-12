@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from playwright_stealth import stealth_async
 
 warnings.filterwarnings("ignore")
-load_dotenv(override=True)
+load_dotenv()
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import (
