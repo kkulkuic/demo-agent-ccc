@@ -4,3 +4,9 @@ __pycache__/
 logs/
 playwright/
 .venv/
+.chainlit/
+chainlit.md
+logs/
+playwright/
+__pycache__/
+*.pyc

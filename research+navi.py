@@ -7,10 +7,20 @@ import warnings
 import uuid
 from typing import Annotated, TypedDict
 from dotenv import load_dotenv
-from playwright_stealth import stealth_async
+try:
+    from playwright_stealth import stealth_async
+except ImportError:
+    # playwright_stealth >= 2.0: Stealth needs to be applied once per context
+    # We store the context manager to keep it alive for the session
+    from playwright_stealth import Stealth
+    _stealth_cm = None  # will be set when context is created
+    async def stealth_async(page):
+        # For 2.x, stealth is already applied to context at creation time
+        # This function is now a no-op for individual pages
+        pass
 
 warnings.filterwarnings("ignore")
-load_dotenv()
+load_dotenv(override=True)
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import (
@@ -80,6 +90,21 @@ async def get_session():
             args=["--window-position=0,0", "--window-size=1280,900"],
         )
         browser_session["context"] = ctx
+        
+        # Apply stealth to context once (for playwright_stealth 2.x)
+        # For 1.x, stealth_async(page) is called on each page
+        try:
+            from playwright_stealth import Stealth
+            stealth = Stealth()
+            # use_async is a context manager that injects stealth scripts
+            # We enter it but don't exit - stealth persists for the context lifetime
+            cm = stealth.use_async(ctx)
+            await cm.__aenter__()
+            global _stealth_cm
+            _stealth_cm = cm
+            print("  🥷 Stealth mode enabled")
+        except Exception as e:
+            print(f"  ⚠️ Stealth failed (continuing without): {e}")
 
         async def on_page(page):
             await stealth_async(page)
@@ -1328,11 +1353,14 @@ research_llm = _base.bind_tools(RESEARCH_TOOLS)
 
 def human_input_node(state: State) -> dict:
     task = interrupt("What would you like to do?")
+    # Handle both string and dict resume values
+    task = task if isinstance(task, str) else str(task)
     mode_answer = interrupt(
         f"Task: \"{task}\"\n"
         f"Mode: navigate (live browser) or research (web search/scrape)? "
         f"Type n or r:"
     )
+    mode_answer = mode_answer if isinstance(mode_answer, str) else str(mode_answer)
     mode = "navigate" if mode_answer.strip().lower().startswith("n") else "research"
     print(f"\n  → Mode: {'🌐' if mode == 'navigate' else '🔍'} {mode}")
     return {
