@@ -1,0 +1,10 @@
+streamlit>=1.40
+langchain-anthropic>=0.3
+langchain-core>=0.3
+langgraph>=0.2
+langgraph-checkpoint>=0.2
+tavily-python>=0.7
+playwright>=1.50
+playwright-stealth
+Pillow>=10
+python-dotenv
