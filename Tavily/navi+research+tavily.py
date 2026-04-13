@@ -944,20 +944,18 @@ Every tool automatically returns a dom_snapshot:
     2. dismiss_popups() once to clear Chrome restore banners before doing anything
     3. browser_click('button[aria-label="Directions"]') to open directions panel
     4. browser_click origin input → browser_type() the starting location
-    5. browser_wait(1) to let suggestions load
-       → call get_accessibility_tree() to read the suggestion list
-       → find the best matching suggestion by name in the tree
-       → call browser_inspect() to get a screenshot
-       → use browser_click_coords() on the suggestion position from the screenshot
-       → NEVER click (200,100) or any hardcoded coordinate before doing these steps
+    5. browser_wait(1) to let suggestions load — follow DROPDOWN RULE:
+       → get_accessibility_tree() to find suggestion by name
+       → browser_inspect() to confirm position from screenshot
+       → browser_click_coords() on confirmed position
+       → NEVER use hardcoded coordinates before completing these steps
     6. browser_click destination input → browser_type() the destination
     7. Repeat step 5 for destination — same process, no guessing
     8. browser_wait(2) then browser_inspect() to confirm route is drawn on map
     9. The route panel MUST be visible before calling stop() — if map is zoomed out
        with no route shown, the directions panel has collapsed:
-       → browser_click('div[id="omnibox-directions"]') to reopen it
-       → or browser_navigate to direct URL format:
-         https://www.google.com/maps/dir/ORIGIN/DESTINATION
+       → browser_click('button[aria-label="Directions"]') to reopen directions panel
+       → re-enter origin and destination using the same typed input process
        → then browser_inspect() to confirm route is visible before stop()
 
     Google Maps transport modes — ALWAYS check all 4 by default:
@@ -1039,23 +1037,32 @@ Every tool automatically returns a dom_snapshot:
                                  dismiss_popups() call — ignore it and proceed with the
                                  task. Never spend more than 1 tool call fighting a popup.
 
+  COORDINATE CLICK RULE:
+  Step 1: browser_inspect() — take a screenshot FIRST
+  Step 2: read the coordinates of the target from the screenshot
+  Step 3: browser_click_coords(x, y) — click using those coordinates
+  This order is MANDATORY. Never skip step 1.
+  NEVER call browser_click_coords() without a browser_inspect() immediately before it.
+  NEVER repeat the same coordinates twice — if a click did not work, go back to step 1.
+
 ━━ ALWAYS END WITH stop() ━━
   NEVER write the answer as plain text — always call stop() as a tool.
   Before calling stop():
-    1. Scroll back to the TOP of the page first (browser_key_press("Control+Home"))
-    2. Then scroll DOWN to the first pricing table or main content section
-    3. browser_inspect() to visually confirm pricing/content is visible on screen
-    4. ONLY call stop(answer=...) when pricing tables or main content are in the screenshot
-    5. NEVER call stop() when the screenshot shows a footer, nav menu, or blank area
+    1. browser_inspect() to confirm the relevant content is visible on screen
+    2. ONLY call stop(answer=...) when the content the user asked for is in the screenshot
+    3. NEVER call stop() when the screenshot shows a footer, nav menu, or blank area
+  For pricing/content pages: scroll to top first, then scroll to first table or heading
+  For Google Maps: confirm blue route line AND travel time are visible
+  For personal info forms: call stop() immediately listing which fields are needed — no scrolling
 
 ━━ DROPDOWN / AUTOCOMPLETE RULE ━━
   Whenever a dropdown or autocomplete suggestion list appears after typing:
     1. browser_wait(1) — let suggestions fully load
-    2. get_accessibility_tree() — read suggestion labels and positions
-    3. browser_inspect() — take a screenshot to visually confirm positions
-    4. browser_click_coords() — click using coordinates from the screenshot
-  NEVER click a dropdown suggestion with a guessed coordinate before doing steps 1-3.
-  If the suggestion is not found in the tree — browser_inspect() first, then click.
+    2. get_accessibility_tree() — find the suggestion by name in the tree
+    3. browser_inspect() — take a screenshot to visually confirm position
+    4. browser_click_coords() — click using coordinates confirmed from screenshot
+  NEVER guess coordinates before completing steps 1-3.
+  This rule takes priority over the fallback chain for dropdown situations.
 
 ━━ FALLBACK CHAIN ━━
   1. dom_snapshot buttons/inputs → browser_click(id or [aria-label='...'])
@@ -1089,66 +1096,94 @@ Every tool automatically returns a dom_snapshot:
     -> Always confirm the blue route line AND travel time are visible before stop().
 
 ━━ PERSONAL INFO RULE ━━
-  NEVER invent or assume personal details — DOB, name, address, phone, email, SSN.
-  If a form requires personal info not provided by the user in their task:
-    1. call stop() immediately
-    2. list exactly which fields are needed
-    3. ask the user to provide them
+  NEVER invent, assume, or guess ANY personal or driver details not explicitly stated by the user.
+  This includes ALL of the following:
+    - Identity:   name, DOB, age, address, phone, email, SSN
+    - Insurance:  currently insured (yes/no), current insurer, policy expiry
+    - Driving:    license status, years licensed, tickets, accidents, violations, DUIs
+    - Vehicle:    ownership status (owned/leased/financed), annual mileage, VIN
+    - Household:  marital status, homeowner status, other drivers
+
+  The ONLY information you may fill in is what the user explicitly stated in their task.
+  Example: if user says "2022 Honda Civic, Chicago IL 60601, minimum liability" —
+    fill in: vehicle (2022 Honda Civic), ZIP (60601), coverage (minimum liability)
+    stop for: everything else
+
+  If a form asks for ANY field not provided by the user:
+    1. call stop() immediately — do not guess, skip, or select a default
+    2. list exactly which fields the form is asking for
+    3. ask the user to provide them before continuing
   Example stop() message:
-    "This form needs: date of birth, full name, and street address.
-     Please provide these and I will continue filling the form."
-  Only use personal details the user has explicitly stated in their task.
+    "The form needs the following details not in your task:
+     - Currently insured? (yes/no)
+     - Current insurer name
+     - Any tickets or accidents?
+     Please provide these and I will continue."
 
 ━━ RESUMING AFTER HUMAN INPUT ━━
   Check url in state. Use dom_snapshot before calling read_page."""
 
 
-RESEARCH_SYSTEM_PROMPT = """You are a Research Assistant with two tools: web_search and deep_scrape.
+RESEARCH_SYSTEM_PROMPT = """You are a Research Assistant. Your job is to search the web, scrape sources, and produce a detailed factual summary with citations.
 
-TOOLS:
-  web_search(query)   → find relevant URLs and summaries for any topic
-  deep_scrape(url)    → extract full content from a specific URL via Tavily
-  web_fetch(url)      → fetch a URL directly via HTTP — use when deep_scrape fails or returns empty
+━━ TOOLS ━━
+  web_search(query)  → returns URLs and snippets for a topic
+  deep_scrape(url)   → extracts full page content from a URL (preferred)
+  web_fetch(url)     → fetches a URL directly via HTTP (fallback if deep_scrape returns empty)
 
-STRICT WORKFLOW — follow this order every time:
-  Step 1: ALWAYS do 2-3 web_searches with DIFFERENT angles/keywords — never repeat the same query.
-           This applies to ALL queries, simple or complex. More searches = more URLs = better answer.
-      -> Examples for "hiking near Chicago":
-           Search 1: "best hiking trails near Chicago Illinois"
-           Search 2: "Forest Preserves Cook County hiking trails"
-           Search 3: "state parks day hikes near Chicago 2025"
-      -> Examples for "best auto insurance Chicago 2025":
-           Search 1: "best auto insurance rates Chicago Illinois 2025"
-           Search 2: "auto insurance discounts Illinois 2025"
-           Search 3: "cheapest auto insurance 2022 Honda Civic Chicago"
-      -> Examples for a simple query like "Starved Rock address":
-           Search 1: "Starved Rock State Park address"
-           Search 2: "Starved Rock State Park location hours"
-           Search 3: "Starved Rock State Park visitor info 2025"
+━━ WORKFLOW — follow this exact sequence every time ━━
 
-  Step 2: deep_scrape OR web_fetch the top URLs collected across ALL searches
-           -> scrape at least 4-6 URLs total for broad queries, 2-3 for simple queries
-           -> try deep_scrape first on each URL
-           -> if deep_scrape returns empty or very little text, retry with web_fetch
-           -> do NOT stop scraping early — more sources = better answer
-  Step 3: compile everything into a final summary — STOP, do not search or scrape again
+  Round 1:
+    1a. web_search with first keyword angle
+    1b. deep_scrape the top 3-4 URLs from that search
+        → if a URL returns empty, retry it once with web_fetch before moving on
 
-RULES:
-1. NEVER call web_search after you have started scraping — plan all searches first, then scrape.
-2. Every web_search call MUST use different keywords — never repeat a query.
-3. ALWAYS scrape at least 4-6 URLs for broad queries before summarizing.
-4. Use web_fetch only as a fallback when deep_scrape fails on the same URL.
-5. Write a clean, well-formatted summary: bullet points, bold key facts, prices, discounts.
-6. Do NOT open a browser or navigate anywhere — text tools only.
-7. After summarising, return control to the human. Do not ask follow-up questions.
+  Round 2:
+    2a. web_search with a DIFFERENT keyword angle (never repeat a previous query)
+    2b. deep_scrape the top 3-4 URLs from that search
 
-CITATIONS - MANDATORY:
-  Write a clean summary first (no inline URLs cluttering the text).
-  At the very end, add a "## Sources" section listing every URL scraped, one per line.
-  Example:
+  Round 3:
+    3a. web_search with a THIRD keyword angle
+    3b. deep_scrape the top 3-4 URLs from that search
+
+  Round 4:
+    Write the final summary and stop. Do not search or scrape again.
+
+  Total expected tool calls: 3 web_searches + 9-12 scrapes = 12-15 calls
+
+━━ SEARCH ANGLE STRATEGY ━━
+  Each web_search must cover a different facet of the topic.
+  Think: overview → specifics → comparison or recency
+  Example for "cloud compute pricing":
+    Round 1: "[topic] pricing tiers overview 2025"
+    Round 2: "[specific provider or feature] cost breakdown"
+    Round 3: "[topic] comparison cheapest options"
+  Never search the same angle twice. Each round must add new information.
+
+━━ OUTPUT — MANDATORY FORMAT ━━
+
+  Your final response must have exactly two sections:
+
+  SECTION 1 — SUMMARY
+  - Write in bullet points with **bold** labels for key items
+  - Include ALL specific data found: exact prices, tier names, percentages,
+    plan features, table values, speeds, limits — do not vague-ify the data
+  - Example good output: "**AWS Lambda**: $0.0000166667 per GB-second, 1M free requests/month"
+  - Example bad output:  "AWS Lambda offers competitive serverless pricing"
+  - No preamble — do not write "I found..." or "Based on research..." — start directly with data
+
+  SECTION 2 — SOURCES
   ## Sources
-  - https://moneygeek.com/insurance/auto/honda-civic-insurance/
-  - https://bankrate.com/insurance/car/..."""
+  - [list every URL that was scraped, one per line]
+  - This section is REQUIRED whenever any URLs were scraped
+  - Never put URLs inline in the summary body — Sources section only
+
+━━ HARD RULES ━━
+  1. Do NOT open a browser or navigate anywhere — text tools only
+  2. Do NOT call web_search after starting to scrape in a round
+  3. Do NOT repeat a search query across rounds
+  4. Do NOT use general knowledge — only output data found in scraped content
+  5. Do NOT ask follow-up questions after the summary — return control to the human"""
 
 # ─────────────────────────────────────────────
 # 6. LOOP & STEP GUARDS
@@ -1279,7 +1314,7 @@ def _safe_messages(messages: list) -> list:
             continue
 
         tool_indices = [j for j, m in enumerate(messages) if isinstance(m, ToolMessage)]
-        is_recent = i in tool_indices[-3:]
+        is_recent = i in tool_indices[-8:]  # keep last 8 tool results so scraped content is visible
         if isinstance(d, dict) and not is_recent:
             d.pop("page_text", None)
             d.pop("buttons", None)
@@ -1399,34 +1434,89 @@ async def research_agent_node(state: State) -> dict:
                 if tc.get("name") == "web_search":
                     search_queries.append(tc.get("args", {}).get("query", "").lower())
 
-    # Keyword appearing 3+ times across queries = spinning on the same topic
+    # Keyword appearing 3+ times across web_search queries = spinning on the same topic
+    # Only count web_search queries — deep_scrape/web_fetch repeating domains is expected
     word_counts: Counter = Counter()
     for q in search_queries:
         for word in q.split():
             if len(word) > 4:
                 word_counts[word] += 1
-    is_looping = any(count >= 3 for count in word_counts.values()) and steps >= 6
-    hard_limit = steps >= 12  # absolute ceiling for research tasks
+    # Need 3+ web_searches AND repeated keywords to flag as looping
+    is_looping = (
+        len(search_queries) >= 4 and  # must have done 4+ searches to be looping
+        any(count >= 3 for count in word_counts.values()) and
+        steps >= 12
+    )
+    hard_limit = steps >= 22  # absolute ceiling: 3 searches x 4 scrapes each = 15 + buffer
 
     if hard_limit or is_looping:
-        reason = "hard limit (12 calls)" if hard_limit else f"redundant searches detected after {steps} calls"
+        reason = "hard limit (22 calls)" if hard_limit else f"redundant searches detected after {steps} calls"
         print(f"\n[Research Budget] {reason} -- forcing final summary.")
         prompt = RESEARCH_SYSTEM_PROMPT + (
-            f"\n\n*** HARD STOP: {reason}. "
-            f"You CANNOT call any more tools. "
-            f"Write your final summary NOW using only what you have already gathered. ***"
+            f"\n\n*** MANDATORY SUMMARY REQUIRED ***\nYou have no tools available. Write your final summary NOW.\nUse ALL the data from the scraped content above — include specific numbers, prices, \npercentages, plan names, tiers, and any comparison data you found.\nDo NOT generalize or omit details — the more specific the better.\nStart immediately with ## heading. End with ## Sources.\nNo preamble. No 'let me'. No general knowledge. Only scraped data. Begin: ***"
         )
-        # _base has no tools bound -- model physically cannot call more tools
-        response = await _base.ainvoke([SystemMessage(content=prompt)] + _safe_messages(raw))
+        from langchain_core.messages import HumanMessage as _HM
+        # Collect all URLs that were scraped so model can cite them
+        scraped_urls = []
+        for msg in raw:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.get("name") in ("deep_scrape", "web_fetch"):
+                        url = tc.get("args", {}).get("url", "")
+                        if url: scraped_urls.append(url)
+        sources_hint = ("\n\nURLs you scraped (MUST appear in ## Sources):\n" +
+                        "\n".join(f"- {u}" for u in scraped_urls)) if scraped_urls else ""
+        forced_msgs = _safe_messages(raw) + [_HM(content=(
+            "STOP. Write your final summary NOW using ONLY the data scraped above — "
+            "do NOT use general knowledge. "
+            "Start immediately with ## and end with ## Sources listing every URL above. "
+            "No preamble. No 'let me'. Begin:" + sources_hint
+        ))]
+        response = await _base.ainvoke([SystemMessage(content=prompt)] + forced_msgs)
+        # Ensure response has content — if empty, inject a fallback summary message
+        r_text = response.content if isinstance(response.content, str) else                  " ".join(b.get("text","") for b in response.content if isinstance(b,dict))
+        if not r_text.strip():
+            from langchain_core.messages import AIMessage as _AI
+            response = _AI(content=(
+                "Research budget reached. Based on the searches completed so far, "
+                "I was unable to compile a full summary. Please try a more specific query "
+                "or ask me to navigate directly to a site for details."
+            ))
 
-    elif steps >= 8:
-        print(f"\n[Research Budget] {steps} calls -- nudging toward summary.")
+    elif steps >= 16:
+        # Soft nudge becomes hard stop too — model ignored text-only nudges
+        print(f"\n[Research Budget] {steps} calls -- forcing summary (nudge escalated).")
         prompt = RESEARCH_SYSTEM_PROMPT + (
-            f"\n\n*** NOTE: {steps} tool calls made. "
-            f"You have enough data. Make at most 1 more targeted deep_scrape if genuinely needed, "
-            f"then write your final summary immediately. ***"
+            f"\n\n*** MANDATORY SUMMARY REQUIRED ***\nYou have no tools available. Write your final summary NOW.\nUse ALL the data from the scraped content above — include specific numbers, prices, \npercentages, plan names, tiers, and any comparison data you found.\nDo NOT generalize or omit details — the more specific the better.\nStart immediately with ## heading. End with ## Sources.\nNo preamble. No 'let me'. No general knowledge. Only scraped data. Begin: ***"
         )
-        response = await research_llm.ainvoke([SystemMessage(content=prompt)] + _safe_messages(raw))
+        # Use _base — no tools bound — physically cannot call more tools
+        # Inject a HumanMessage as final turn so model treats it as direct instruction
+        from langchain_core.messages import HumanMessage as _HM
+        scraped_urls = []
+        for msg in raw:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.get("name") in ("deep_scrape", "web_fetch"):
+                        url = tc.get("args", {}).get("url", "")
+                        if url: scraped_urls.append(url)
+        sources_hint = ("\n\nURLs you scraped (MUST appear in ## Sources):\n" +
+                        "\n".join(f"- {u}" for u in scraped_urls)) if scraped_urls else ""
+        forced_msgs = _safe_messages(raw) + [_HM(content=(
+            "STOP. Write your final summary NOW using ONLY the scraped data above. "
+            "Do NOT use general knowledge. "
+            "Start with ## and end with ## Sources listing every URL below. "
+            "No preamble. No 'let me'. Begin:" + sources_hint
+        ))]
+        response = await _base.ainvoke([SystemMessage(content=prompt)] + forced_msgs)
+        r_text = response.content if isinstance(response.content, str) else \
+                 " ".join(b.get("text","") for b in response.content if isinstance(b,dict))
+        if not r_text.strip():
+            from langchain_core.messages import AIMessage as _AI
+            response = _AI(content=(
+                "I have gathered sufficient data but hit the research budget. "
+                "Please ask me to navigate directly to one of the sites for more detail, "
+                "or refine your query for a more focused search."
+            ))
 
     else:
         response = await research_llm.ainvoke(
